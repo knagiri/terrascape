@@ -10,4 +10,4 @@ RTMP_URL="${RTMP_URL:-rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY:?YOUT
 
 rpicam-vid --codec h264 --inline -t 0 --camera "$CAMERA_INDEX" \
   --width "$STREAM_WIDTH" --height "$STREAM_HEIGHT" --framerate "$STREAM_FPS" -o - \
-  | ffmpeg -f h264 -i - -c copy -f flv "$RTMP_URL"
+  | ffmpeg -f h264 -framerate "$STREAM_FPS" -i - -c copy -f flv "$RTMP_URL"
