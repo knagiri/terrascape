@@ -1,0 +1,16 @@
+[Unit]
+Description=Terrascape YouTube Live streaming
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ry
+WorkingDirectory=/home/ry/terrascape
+EnvironmentFile=/home/ry/terrascape/.env
+ExecStart=/home/ry/terrascape/scripts/stream.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
