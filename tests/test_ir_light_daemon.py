@@ -70,6 +70,12 @@ def test_main_turns_led_off_and_closes_on_sigterm(monkeypatch):
     signal.signal(SIGTERM, ...) を登録していなければ、signal.getsignal(SIGTERM) は
     callable でない既定値 (SIG_DFL) を返すため呼び出しが TypeError になり、
     このテストはガード無しでは落ちる（判別力の確認）。
+
+    compute_brightness を昼夜に関わらず常に 0.3 (点灯) を返すよう monkeypatch する。
+    実時刻依存のままだと、テストを昼間に実行した場合 compute_brightness が 0.0 を返し、
+    led.value は最初から 0.0 のままになる。その場合 finally から led.off() を削除しても
+    アサーションが偶然通ってしまい、実行時刻次第でガードが空振りする
+    （実測: led.off() を外した変異でテストが落ちることを確認済み）。
     """
     monkeypatch.setenv("IR_LIGHT_GPIO_PIN", "18")
     monkeypatch.setenv("IR_LIGHT_LATITUDE", "35.0")
@@ -102,6 +108,8 @@ def test_main_turns_led_off_and_closes_on_sigterm(monkeypatch):
 
     monkeypatch.setattr(ir_light_daemon, "PWMLED", _tracking_pwmled)
     monkeypatch.setattr(ir_light_daemon.time, "sleep", _deliver_sigterm)
+    # 実行時刻に関わらず点灯状態を強制する（上のテスト docstring 参照）。
+    monkeypatch.setattr(ir_light_daemon, "compute_brightness", lambda *a, **k: 0.3)
 
     try:
         with pytest.raises(SystemExit):
@@ -110,5 +118,7 @@ def test_main_turns_led_off_and_closes_on_sigterm(monkeypatch):
         signal.signal(signal.SIGTERM, original_sigterm_handler)
 
     led = state["led"]
+    # led.off() が close() の前に効いて 0.0 に戻っていることを検証する
+    # （compute_brightness を 0.3 固定にしたので、off() が無ければここは 0.3 のまま）。
     assert state["value_before_close"] == 0.0
     assert led.closed
