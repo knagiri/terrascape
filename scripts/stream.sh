@@ -11,7 +11,12 @@ RTMP_URL="${RTMP_URL:-rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY:?YOUT
 rpicam-vid --codec h264 --inline -t 0 --camera "$CAMERA_INDEX" \
   --width "$STREAM_WIDTH" --height "$STREAM_HEIGHT" --framerate "$STREAM_FPS" -o - \
   | ffmpeg -hide_banner -loglevel warning \
-      -f h264 -framerate "$STREAM_FPS" -i - -c copy -f flv "$RTMP_URL"
+      -f h264 -framerate "$STREAM_FPS" -i - \
+      -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
+      -map 0:v -map 1:a -c:v copy -c:a aac -b:a 128k -shortest -f flv "$RTMP_URL"
+  # -shortest: anullsrc は無限入力なので、これが無いと rpicam-vid が
+  # 落ちて映像入力が EOF になっても ffmpeg が音声だけで配信を続けてしまい、
+  # systemd の Restart=always が発火しない。最短入力（映像）に合わせて終了させる。
   # -loglevel warning: 既定の info レベルだと ffmpeg が
   # `Output #0, flv, to 'rtmp://.../live2/<KEY>'` をストリームキー入りで
   # stderr に出力し、systemd 配下では journal に残ってしまう
