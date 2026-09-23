@@ -54,9 +54,15 @@ journal の共有・貼り付けは引き続き避けること。
 ### セットアップ
 
 ```bash
-python3 -m venv .venv
+python3 -m venv --system-site-packages .venv
 .venv/bin/pip install -r requirements.txt
 ```
+
+`--system-site-packages` が必須。Raspberry Pi OS は GPIO の PWM 制御に使う `lgpio` バックエンドを
+`python3-lgpio`（apt パッケージ）としてシステム Python 側に用意しており、通常の venv だとこれを
+継承できず `gpiozero` が PWM 非対応の `NativeFactory` にフォールバックして `PWMLED` の生成時に
+`PinPWMUnsupported` 例外になる（実機で確認済み）。PyPI の `lgpio` パッケージを venv 内に pip
+install する方法は、Python 3.13 環境では C 拡張のビルドが失敗するため使えない。
 
 `.env` に `IR_LIGHT_LATITUDE` / `IR_LIGHT_LONGITUDE` / `IR_LIGHT_TIMEZONE`（設置場所の緯度・経度・
 タイムゾーン）を設定する。`IR_LIGHT_BRIGHTNESS`（0.0〜1.0のPWM duty cycle）は暫定値であり、
@@ -67,6 +73,3 @@ sudo systemctl enable --now terrascape-ir-light
 ```
 
 ログは `journalctl -u terrascape-ir-light -f` で確認できる。
-
-`gpiozero` が実機の GPIO バックエンド（`lgpio` 等）を自動検出できない環境では、
-`.venv/bin/pip install lgpio` 等の追加インストールが必要になる場合がある。
