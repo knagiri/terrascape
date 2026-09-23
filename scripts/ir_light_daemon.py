@@ -3,6 +3,7 @@
 
 import datetime
 import os
+import signal
 import time
 import zoneinfo
 
@@ -35,10 +36,22 @@ def today_sun_times(latitude, longitude, tz):
     return s["sunrise"], s["sunset"]
 
 
+def _raise_system_exit(signum, frame):
+    """SIGTERM ハンドラ。SystemExit を送出して main() の try/finally に led.close() を実行させる。
+
+    systemctl stop/restart は SIGTERM を送るが、Python は SIGTERM の既定動作では
+    プロセスを即終了させ、KeyboardInterrupt(SIGINT) しか拾えない finally は
+    走らない。この生体用 IR ライトは点灯時間を最小限にすべきなので、ハンドラを
+    明示登録して finally 内の消灯・close を必ず通す。
+    """
+    raise SystemExit(0)
+
+
 def main():
     config = load_config()
     tz = zoneinfo.ZoneInfo(config["timezone"])
     led = PWMLED(config["gpio_pin"])
+    signal.signal(signal.SIGTERM, _raise_system_exit)
 
     try:
         while True:
@@ -47,6 +60,8 @@ def main():
             led.value = compute_brightness(now, sunrise, sunset, config["brightness"])
             time.sleep(POLL_INTERVAL_SECONDS)
     finally:
+        # 停止時点の PWM 出力レベルのまま close() で放置しないよう、先に明示消灯する。
+        led.off()
         led.close()
 
 
