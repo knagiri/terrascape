@@ -1,0 +1,14 @@
+[Unit]
+Description=Terrascape IR light auto control
+
+[Service]
+Type=simple
+User=ry
+WorkingDirectory=/home/ry/terrascape
+EnvironmentFile=/home/ry/terrascape/.env
+ExecStart=/home/ry/terrascape/.venv/bin/python3 /home/ry/terrascape/scripts/ir_light_daemon.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

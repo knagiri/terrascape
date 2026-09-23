@@ -14,6 +14,7 @@ terrascape/
 ├── README.md
 ├── .gitignore
 ├── .env.example    # .env の雛形。コピーして値を埋める
+├── requirements.txt # Python 依存パッケージ（IR ライトデーモン用）
 ├── scripts/        # 実行スクリプト
 └── systemd/        # systemd unit ファイル
 ```
@@ -44,3 +45,28 @@ sudo systemctl enable --now terrascape-stream
 `warning` に抑えて配信先 URL（ストリームキー入り）が journal に残らないようにしているが、
 接続エラー時の warning/error ログや `ps` での起動コマンド確認では URL が見えうるため、
 journal の共有・貼り付けは引き続き避けること。
+
+## IR ライト自動点灯
+
+日没から日の出まで、940nm 赤外線 LED を GPIO18 経由で PWM 点灯させる常駐サービス。回路の詳細は
+`docs/hardware/ir-light-circuit.md` を参照。
+
+### セットアップ
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+`.env` に `IR_LIGHT_LATITUDE` / `IR_LIGHT_LONGITUDE` / `IR_LIGHT_TIMEZONE`（設置場所の緯度・経度・
+タイムゾーン）を設定する。`IR_LIGHT_BRIGHTNESS`（0.0〜1.0のPWM duty cycle）は暫定値であり、
+実機でカメラの映りと生体への影響を見ながら調整して決める。
+
+```bash
+sudo systemctl enable --now terrascape-ir-light
+```
+
+ログは `journalctl -u terrascape-ir-light -f` で確認できる。
+
+`gpiozero` が実機の GPIO バックエンド（`lgpio` 等）を自動検出できない環境では、
+`.venv/bin/pip install lgpio` 等の追加インストールが必要になる場合がある。
