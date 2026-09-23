@@ -20,7 +20,7 @@
 ## 2. 映像のタイムスタンプ未設定による A/V 同期ずれ（[#10](https://github.com/knagiri/terrascape/pull/10)）
 
 - **症状**: Stream Health が「要改善」。journal に `Timestamps are unset in a packet for stream 0.` の警告
-- **原因**: pipe で渡す raw H.264 にはコンテナのタイムスタンプが無い。wallclock 基準で生成される `anullsrc` の音声と mux する際、映像側のタイムスタンプが正しく付かず同期がずれていた
+- **原因**: pipe で渡す raw H.264 にはコンテナのタイムスタンプが無く、映像パケットの pts が未設定になっていた。`anullsrc` はウォールクロックではなく出力したサンプル数から連続したタイムスタンプを生成するため、その音声と mux するには映像側にもウォールクロック基準でタイムスタンプを付ける必要があった
 - **修正**: 映像入力に `-use_wallclock_as_timestamps 1` を付け、映像もウォールクロック基準でタイムスタンプを生成させる
 
 ## 3. keyframe 間隔が未指定（[#11](https://github.com/knagiri/terrascape/pull/11)）
