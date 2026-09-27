@@ -2,7 +2,44 @@
 
 import datetime
 import math
+import os
+import signal
 import subprocess
+import sys
+import time
+import zoneinfo
+
+from astral import LocationInfo
+from astral.sun import sun
+
+import youtube_broadcast
+
+POLL_INTERVAL_SECONDS = 60
+WAIT_FOR_LIVE_TIMEOUT_SECONDS = 180
+WAIT_FOR_LIVE_POLL_INTERVAL_SECONDS = 10
+
+
+def load_config():
+    return {
+        "camera_index": int(os.environ["CAMERA_INDEX"]),
+        "stream_width": int(os.environ["STREAM_WIDTH"]),
+        "stream_height": int(os.environ["STREAM_HEIGHT"]),
+        "stream_fps": int(os.environ["STREAM_FPS"]),
+        "youtube_stream_key": os.environ["YOUTUBE_STREAM_KEY"],
+        "youtube_client_id": os.environ["YOUTUBE_CLIENT_ID"],
+        "youtube_client_secret": os.environ["YOUTUBE_CLIENT_SECRET"],
+        "youtube_refresh_token": os.environ["YOUTUBE_REFRESH_TOKEN"],
+        "latitude": float(os.environ["IR_LIGHT_LATITUDE"]),
+        "longitude": float(os.environ["IR_LIGHT_LONGITUDE"]),
+        "timezone": os.environ["IR_LIGHT_TIMEZONE"],
+        "max_segment_hours": float(os.environ["MAX_SEGMENT_HOURS"]),
+    }
+
+
+def today_sun_times(latitude, longitude, tz):
+    location = LocationInfo(latitude=latitude, longitude=longitude, timezone=str(tz))
+    s = sun(location.observer, date=datetime.datetime.now(tz).date(), tzinfo=tz)
+    return s["sunrise"], s["sunset"]
 
 
 def compute_segments(sunset, sunrise, max_segment_hours):
@@ -90,3 +127,96 @@ def stop_encoder(rpicam_proc, ffmpeg_proc, timeout_seconds=10):
 
 def encoder_is_alive(rpicam_proc, ffmpeg_proc):
     return rpicam_proc.poll() is None and ffmpeg_proc.poll() is None
+
+
+def _raise_system_exit(signum, frame):
+    """SIGTERM ハンドラ。ir_light_daemon.py と同じ理由で、finally でのエンコーダ停止を保証する。"""
+    raise SystemExit(0)
+
+
+def _build_rtmp_url(stream_key):
+    return f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
+
+
+def main():
+    config = load_config()
+    tz = zoneinfo.ZoneInfo(config["timezone"])
+    signal.signal(signal.SIGTERM, _raise_system_exit)
+
+    youtube = youtube_broadcast.build_youtube_client(
+        config["youtube_client_id"],
+        config["youtube_client_secret"],
+        config["youtube_refresh_token"],
+    )
+    stream_id = youtube_broadcast.find_stream_id(youtube, config["youtube_stream_key"])
+    if stream_id is None:
+        raise RuntimeError("YOUTUBE_STREAM_KEY に対応する liveStream が見つかりません")
+
+    rpicam_proc = None
+    ffmpeg_proc = None
+    current_segment_end = None
+
+    try:
+        while True:
+            now = datetime.datetime.now(tz)
+            sunrise, sunset = today_sun_times(config["latitude"], config["longitude"], tz)
+            segments = compute_segments(sunset, sunrise, config["max_segment_hours"])
+            active_segment = next(
+                (s for s in segments if s[0] <= now < s[1]), None
+            )
+
+            if active_segment is not None:
+                try:
+                    if rpicam_proc is None:
+                        title = f"Terrascape Live {now:%Y-%m-%d %H:%M}"
+                        broadcast_id = youtube_broadcast.create_broadcast(
+                            youtube, stream_id, title, privacy_status="unlisted"
+                        )
+                        rpicam_proc, ffmpeg_proc = start_encoder(
+                            config, _build_rtmp_url(config["youtube_stream_key"])
+                        )
+                        current_segment_end = active_segment[1]
+                        if not youtube_broadcast.wait_for_live(
+                            youtube,
+                            broadcast_id,
+                            WAIT_FOR_LIVE_TIMEOUT_SECONDS,
+                            WAIT_FOR_LIVE_POLL_INTERVAL_SECONDS,
+                        ):
+                            # live にならなかった。一度止めて次のポーリングサイクルで再試行する。
+                            stop_encoder(rpicam_proc, ffmpeg_proc)
+                            rpicam_proc = None
+                            ffmpeg_proc = None
+                            current_segment_end = None
+                    elif current_segment_end != active_segment[1]:
+                        # セグメント境界をまたいだ（分割点に到達した）。一度止めて
+                        # 次のポーリングサイクルで新しいセグメントとして再作成する。
+                        stop_encoder(rpicam_proc, ffmpeg_proc)
+                        rpicam_proc = None
+                        ffmpeg_proc = None
+                        current_segment_end = None
+                    elif not encoder_is_alive(rpicam_proc, ffmpeg_proc):
+                        # 配信時間帯中にクラッシュした。同じセグメント内で再起動する。
+                        rpicam_proc, ffmpeg_proc = start_encoder(
+                            config, _build_rtmp_url(config["youtube_stream_key"])
+                        )
+                except Exception as exc:
+                    # YouTube API のネットワークエラー・トークン失効等はここで捕まえ、
+                    # プロセス全体をクラッシュさせず次のポーリングサイクルでリトライする
+                    # （spec の要求どおり）。rpicam_proc が既に起動済みなら状態はそのまま
+                    # 保持し、次のループで encoder_is_alive の分岐に自然に合流する。
+                    print(f"stream_scheduler: error handling segment: {exc}", file=sys.stderr)
+            else:
+                if rpicam_proc is not None:
+                    stop_encoder(rpicam_proc, ffmpeg_proc)
+                    rpicam_proc = None
+                    ffmpeg_proc = None
+                    current_segment_end = None
+
+            time.sleep(POLL_INTERVAL_SECONDS)
+    finally:
+        if rpicam_proc is not None:
+            stop_encoder(rpicam_proc, ffmpeg_proc)
+
+
+if __name__ == "__main__":
+    main()
