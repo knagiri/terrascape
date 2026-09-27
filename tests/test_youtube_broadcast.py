@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 import youtube_broadcast
 
@@ -67,7 +67,6 @@ def test_get_lifecycle_status_returns_status_field():
 
 def test_wait_for_live_returns_true_once_live():
     youtube = _make_youtube_mock()
-    statuses = iter(["testing", "testing", "live"])
     youtube.liveBroadcasts().list.return_value.execute.side_effect = [
         {"items": [{"status": {"lifeCycleStatus": s}}]} for s in ["testing", "testing", "live"]
     ]
@@ -82,7 +81,7 @@ def test_wait_for_live_returns_true_once_live():
     assert len(sleep_calls) == 2  # live になる前に2回ポーリング待機した
 
 
-def test_wait_for_live_returns_false_on_timeout():
+def test_wait_for_live_returns_false_on_timeout(monkeypatch):
     youtube = _make_youtube_mock()
     youtube.liveBroadcasts().list.return_value.execute.return_value = {
         "items": [{"status": {"lifeCycleStatus": "testing"}}]
@@ -94,22 +93,18 @@ def test_wait_for_live_returns_false_on_timeout():
         if call_count["n"] > 5:
             raise AssertionError("timeout で止まらずポーリングし続けている")
 
-    import time as time_module
-    original_monotonic = time_module.monotonic
     times = iter([0, 1, 2, 3, 200])  # 4回目のチェックで timeout_seconds=100 を超える
 
     def fake_monotonic():
         return next(times, 999)
 
-    import youtube_broadcast as yb
-    orig = yb.time.monotonic
-    yb.time.monotonic = fake_monotonic
-    try:
-        result = yb.wait_for_live(
-            youtube, "bcast-1", timeout_seconds=100, poll_interval_seconds=1,
-            sleep_fn=fake_sleep,
-        )
-    finally:
-        yb.time.monotonic = orig
+    # モジュールが参照する time.monotonic だけを差し替える。monkeypatch なら
+    # テスト終了時に自動で元に戻るため、例外発生時の復元漏れが起きない。
+    monkeypatch.setattr(youtube_broadcast.time, "monotonic", fake_monotonic)
+
+    result = youtube_broadcast.wait_for_live(
+        youtube, "bcast-1", timeout_seconds=100, poll_interval_seconds=1,
+        sleep_fn=fake_sleep,
+    )
 
     assert result is False
