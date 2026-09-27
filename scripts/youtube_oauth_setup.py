@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""YouTube Data API の OAuth 認可を一度だけ手動で行い、refresh token を発行するツール。
+
+ブラウザが開けるマシン（Pi である必要はない）で実行する。表示された refresh token を
+対象機の .env の YOUTUBE_REFRESH_TOKEN に貼り付ける。
+"""
+
+import sys
+
+from google_auth_oauthlib.flow import InstalledAppFlow
+
+SCOPES = ["https://www.googleapis.com/auth/youtube"]
+
+
+def main():
+    if len(sys.argv) != 3:
+        print(f"usage: {sys.argv[0]} <client_id> <client_secret>", file=sys.stderr)
+        sys.exit(1)
+
+    client_id, client_secret = sys.argv[1], sys.argv[2]
+    client_config = {
+        "installed": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": ["http://localhost"],
+        }
+    }
+    flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+    credentials = flow.run_local_server(port=0)
+
+    print("認可に成功しました。以下を .env の YOUTUBE_REFRESH_TOKEN に設定してください:")
+    print(credentials.refresh_token)
+
+
+if __name__ == "__main__":
+    main()
