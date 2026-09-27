@@ -32,19 +32,44 @@ sudo systemctl daemon-reload
 
 各サービスの有効化方法はサービスごとの節を参照。
 
-## 配信
+## 配信（日没〜日の出のスケジュール配信）
 
 ```bash
 chmod 600 .env
-sudo systemctl enable --now terrascape-stream
+python3 -m venv --system-site-packages .venv   # IR ライトと共通の venv（作成済みなら不要）
+.venv/bin/pip install -r requirements.txt
+sudo systemctl enable --now terrascape-stream-scheduler
 ```
 
-`.env` の `YOUTUBE_STREAM_KEY` に YouTube Studio で取得したストリームキーを設定してから
-有効化すること。ストリームキーを含むので、`.env` は `chmod 600` で本人以外から読めないようにしておく。
-ログは `journalctl -u terrascape-stream -f` で確認できる。`scripts/stream.sh` は ffmpeg のログレベルを
+`.env` に以下を設定してから有効化すること。
+
+- `YOUTUBE_STREAM_KEY`: YouTube Studio で取得したストリームキー
+- `YOUTUBE_CLIENT_ID` / `YOUTUBE_CLIENT_SECRET` / `YOUTUBE_REFRESH_TOKEN`: 下記「YouTube Data API の
+  OAuth 初回セットアップ」で一度だけ発行する
+- `IR_LIGHT_LATITUDE` / `IR_LIGHT_LONGITUDE` / `IR_LIGHT_TIMEZONE`: 日没・日の出の計算に IR ライトと
+  同じ設置場所の値を使う
+
+日没〜日の出の間だけ自動的に配信を開始・終了する。`MAX_SEGMENT_HOURS`（既定10時間）を
+超える夜は、均等な長さの複数本の配信に自動分割される。
+
+ストリームキーや OAuth の秘密情報を含むので、`.env` は `chmod 600` で本人以外から読めないようにしておく。
+ログは `journalctl -u terrascape-stream-scheduler -f` で確認できる。スケジューラは ffmpeg のログレベルを
 `warning` に抑えて配信先 URL（ストリームキー入り）が journal に残らないようにしているが、
 接続エラー時の warning/error ログや `ps` での起動コマンド確認では URL が見えうるため、
 journal の共有・貼り付けは引き続き避けること。
+
+手動での短時間テスト配信には、スケジューラを介さず `scripts/stream.sh` を直接実行できる
+（`.env` を読み込んだ上で `./scripts/stream.sh` を実行する）。
+
+以前の常時配信 unit（`terrascape-stream`）で運用していた環境では、有効化の前に旧 unit を止めて
+リンクを外し、新しい unit をリンクしておく（新規セットアップでは「セットアップ」節のリンクで足りる）:
+
+```bash
+sudo systemctl disable --now terrascape-stream
+sudo rm /etc/systemd/system/terrascape-stream.service
+sudo ln -s ~/terrascape/systemd/terrascape-stream-scheduler.service /etc/systemd/system/
+sudo systemctl daemon-reload
+```
 
 ### YouTube Data API の OAuth 初回セットアップ
 

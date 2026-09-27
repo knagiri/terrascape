@@ -1,5 +1,5 @@
 [Unit]
-Description=Terrascape YouTube Live streaming
+Description=Terrascape scheduled YouTube Live streaming
 After=network-online.target
 Wants=network-online.target
 
@@ -8,7 +8,7 @@ Type=simple
 User=ry
 WorkingDirectory=/home/ry/terrascape
 EnvironmentFile=/home/ry/terrascape/.env
-ExecStart=/home/ry/terrascape/scripts/stream.sh
+ExecStart=/home/ry/terrascape/.venv/bin/python /home/ry/terrascape/scripts/stream_scheduler.py
 Restart=always
 RestartSec=5
 
