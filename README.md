@@ -48,9 +48,11 @@ sudo systemctl enable --now terrascape-stream-scheduler
   OAuth 初回セットアップ」で一度だけ発行する
 - `IR_LIGHT_LATITUDE` / `IR_LIGHT_LONGITUDE` / `IR_LIGHT_TIMEZONE`: 日没・日の出の計算に IR ライトと
   同じ設置場所の値を使う
+- `MAX_SEGMENT_HOURS`: 1本の配信の最大時間（時間単位）。既定値は無く必須。`.env.example` の
+  雛形値は 10
 
-日没〜日の出の間だけ自動的に配信を開始・終了する。`MAX_SEGMENT_HOURS`（既定10時間）を
-超える夜は、均等な長さの複数本の配信に自動分割される。
+日没〜日の出の間だけ自動的に配信を開始・終了する。`MAX_SEGMENT_HOURS` を超える夜は、
+均等な長さの複数本の配信に自動分割される。
 
 ストリームキーや OAuth の秘密情報を含むので、`.env` は `chmod 600` で本人以外から読めないようにしておく。
 ログは `journalctl -u terrascape-stream-scheduler -f` で確認できる。スケジューラは ffmpeg のログレベルを
@@ -58,15 +60,27 @@ sudo systemctl enable --now terrascape-stream-scheduler
 接続エラー時の warning/error ログや `ps` での起動コマンド確認では URL が見えうるため、
 journal の共有・貼り付けは引き続き避けること。
 
-手動での短時間テスト配信には、スケジューラを介さず `scripts/stream.sh` を直接実行できる
-（`.env` を読み込んだ上で `./scripts/stream.sh` を実行する）。
+手動での短時間テスト配信には、スケジューラを介さず `scripts/stream.sh` を直接実行できる。
+`.env` は `export` 無しの `KEY=VALUE` 形式なので、素の `source`/`.` では子プロセスの
+`stream.sh` に環境変数が渡らない。`set -a` で以降の変数代入を自動 export してから読み込む:
+
+```bash
+set -a; . ./.env; set +a
+./scripts/stream.sh
+```
 
 以前の常時配信 unit（`terrascape-stream`）で運用していた環境では、有効化の前に旧 unit を止めて
-リンクを外し、新しい unit をリンクしておく（新規セットアップでは「セットアップ」節のリンクで足りる）:
+リンクを外し、新しい unit をリンクしておく（新規セットアップでは「セットアップ」節のリンクで足りる）。
+また、新しい unit は `MAX_SEGMENT_HOURS` / `YOUTUBE_CLIENT_ID` / `YOUTUBE_CLIENT_SECRET` /
+`YOUTUBE_REFRESH_TOKEN` / `IR_LIGHT_LATITUDE` / `IR_LIGHT_LONGITUDE` / `IR_LIGHT_TIMEZONE` を
+必須で読むため、旧 `.env` のままでは起動時に `KeyError` で落ちて `Restart=always` により
+再起動を繰り返す。有効化の前に `.env.example` と見比べて不足しているキーを `.env` に
+追記しておく:
 
 ```bash
 sudo systemctl disable --now terrascape-stream
 sudo rm /etc/systemd/system/terrascape-stream.service
+diff .env.example .env   # 不足しているキーを確認し、.env に追記する
 sudo ln -s ~/terrascape/systemd/terrascape-stream-scheduler.service /etc/systemd/system/
 sudo systemctl daemon-reload
 ```
