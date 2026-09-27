@@ -3,8 +3,14 @@
 
 ブラウザが開けるマシン（Pi である必要はない）で実行する。表示された refresh token を
 対象機の .env の YOUTUBE_REFRESH_TOKEN に貼り付ける。
+
+client id / client secret は環境変数 YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET から読み、
+未設定なら対話入力させる。コマンドライン引数で受け取らないのは、shell history や
+ps から client secret が見えてしまうため。
 """
 
+import getpass
+import os
 import sys
 
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -13,11 +19,23 @@ SCOPES = ["https://www.googleapis.com/auth/youtube"]
 
 
 def main():
-    if len(sys.argv) != 3:
-        print(f"usage: {sys.argv[0]} <client_id> <client_secret>", file=sys.stderr)
+    if len(sys.argv) != 1:
+        print(
+            f"usage: {sys.argv[0]}\n"
+            "  YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET を環境変数で渡すか、"
+            "起動後の対話入力で指定する",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    client_id, client_secret = sys.argv[1], sys.argv[2]
+    client_id = os.environ.get("YOUTUBE_CLIENT_ID") or input("YOUTUBE_CLIENT_ID: ").strip()
+    client_secret = os.environ.get("YOUTUBE_CLIENT_SECRET") or getpass.getpass(
+        "YOUTUBE_CLIENT_SECRET: "
+    ).strip()
+    if not client_id or not client_secret:
+        print("エラー: client id と client secret の両方が必要です。", file=sys.stderr)
+        sys.exit(1)
+
     client_config = {
         "installed": {
             "client_id": client_id,

@@ -14,7 +14,7 @@ terrascape/
 ├── README.md
 ├── .gitignore
 ├── .env.example    # .env の雛形。コピーして値を埋める
-├── requirements.txt # Python 依存パッケージ（IR ライトデーモン用）
+├── requirements.txt # Python 依存パッケージ（IR ライトデーモン・配信スケジューラ用）
 ├── scripts/        # 実行スクリプト
 └── systemd/        # systemd unit ファイル
 ```
@@ -45,6 +45,23 @@ sudo systemctl enable --now terrascape-stream
 `warning` に抑えて配信先 URL（ストリームキー入り）が journal に残らないようにしているが、
 接続エラー時の warning/error ログや `ps` での起動コマンド確認では URL が見えうるため、
 journal の共有・貼り付けは引き続き避けること。
+
+### YouTube Data API の OAuth 初回セットアップ
+
+配信スケジューラが YouTube Data API で broadcast を作成するための refresh token を一度だけ発行する。
+Google Cloud Console で YouTube Data API v3 を有効化し、OAuth クライアント（種類: デスクトップアプリ）を
+作成してから、ブラウザを開けるマシン（Pi である必要はない）で実行する。
+
+```bash
+python3 -m venv /tmp/oauth-venv && /tmp/oauth-venv/bin/pip install google-auth-oauthlib
+/tmp/oauth-venv/bin/python scripts/youtube_oauth_setup.py
+```
+
+client id / client secret は起動後に対話入力する（環境変数 `YOUTUBE_CLIENT_ID` /
+`YOUTUBE_CLIENT_SECRET` があればそれを使う）。client secret が shell history や `ps` に残らないよう、
+コマンドライン引数では渡さない。ブラウザでの認可後に表示される refresh token を、client id /
+client secret と合わせて `.env` の `YOUTUBE_CLIENT_ID` / `YOUTUBE_CLIENT_SECRET` /
+`YOUTUBE_REFRESH_TOKEN` に設定する。
 
 ## IR ライト自動点灯
 
