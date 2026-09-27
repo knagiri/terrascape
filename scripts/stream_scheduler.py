@@ -36,10 +36,33 @@ def load_config():
     }
 
 
-def today_sun_times(latitude, longitude, tz):
+def current_night_sun_times(latitude, longitude, tz, now):
+    """now を含む「夜」（日没〜翌日の日の出）の sunset と sunrise を返す。
+
+    当日の sunrise/sunset だけを見ると、日没後は当日 sunset が過去、日の出は
+    「翌日」のものが必要になり、逆に日の出前（深夜〜明け方）は「前日」の sunset が
+    必要になる。単純に当日の sunrise/sunset をペアで返すと sunset > sunrise になり
+    compute_segments の区間が負（本番では配信が始まらない、設定によっては
+    ZeroDivisionError）になっていたため、now を基準に前日/翌日へまたいで解決する。
+
+    date だけで日没後/日の出前を判定せず、now と当日の sunrise を比較しているのは、
+    0時をまたいでも同じ夜として同じタプルを返すようにするため（日付境界で余計な
+    セグメント再作成が走らないように current_segment_end を安定させる）。
+    """
     location = LocationInfo(latitude=latitude, longitude=longitude, timezone=str(tz))
-    s = sun(location.observer, date=datetime.datetime.now(tz).date(), tzinfo=tz)
-    return s["sunrise"], s["sunset"]
+    today = now.date()
+    today_sun = sun(location.observer, date=today, tzinfo=tz)
+    if now < today_sun["sunrise"]:
+        # 深夜〜明け方: 今夜はまだ続いている前日の夜。前日の sunset と当日の sunrise の組。
+        yesterday_sun = sun(
+            location.observer, date=today - datetime.timedelta(days=1), tzinfo=tz
+        )
+        return yesterday_sun["sunset"], today_sun["sunrise"]
+    # 日中〜日没後: これから、または今始まっている夜。当日の sunset と翌日の sunrise の組。
+    tomorrow_sun = sun(
+        location.observer, date=today + datetime.timedelta(days=1), tzinfo=tz
+    )
+    return today_sun["sunset"], tomorrow_sun["sunrise"]
 
 
 def compute_segments(sunset, sunrise, max_segment_hours):
@@ -159,7 +182,9 @@ def main():
     try:
         while True:
             now = datetime.datetime.now(tz)
-            sunrise, sunset = today_sun_times(config["latitude"], config["longitude"], tz)
+            sunset, sunrise = current_night_sun_times(
+                config["latitude"], config["longitude"], tz, now
+            )
             segments = compute_segments(sunset, sunrise, config["max_segment_hours"])
             active_segment = next(
                 (s for s in segments if s[0] <= now < s[1]), None

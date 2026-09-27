@@ -42,6 +42,50 @@ def test_compute_segments_exactly_at_limit_no_split():
     assert segments == [(sunset, sunrise)]
 
 
+LATITUDE = 35.6851
+LONGITUDE = 139.7527
+
+
+def test_current_night_sun_times_after_sunset_contains_now_with_positive_duration():
+    # astral をモックせず実際の日の出/日の入り計算を使う回帰テスト。
+    # 旧 today_sun_times は当日の sunrise/sunset をそのまま返すため、日没後は
+    # sunset(当日) > sunrise(当日) になり compute_segments の区間が負になっていた
+    # （修正前のコードでは本テストが落ちる。ZeroDivisionError または now を含まない
+    # 空の segments になる）。
+    now = _dt(23, 0)  # 日没後
+    sunset, sunrise = stream_scheduler.current_night_sun_times(
+        LATITUDE, LONGITUDE, JST, now
+    )
+    assert sunset < sunrise
+    segments = stream_scheduler.compute_segments(sunset, sunrise, max_segment_hours=10)
+    assert any(s[0] <= now < s[1] for s in segments)
+
+
+def test_current_night_sun_times_after_midnight_contains_now_with_positive_duration():
+    now = _dt(2, 0, day=2)  # 日付が変わった後、日の出前
+    sunset, sunrise = stream_scheduler.current_night_sun_times(
+        LATITUDE, LONGITUDE, JST, now
+    )
+    assert sunset < sunrise
+    segments = stream_scheduler.compute_segments(sunset, sunrise, max_segment_hours=10)
+    assert any(s[0] <= now < s[1] for s in segments)
+
+
+def test_current_night_sun_times_same_night_before_and_after_midnight():
+    # 日没後と0時後で「同じ夜」（同じ sunset/sunrise の組）を返すことを確認する。
+    # main() の current_segment_end はこのタプルの sunrise 側から導かれるセグメント
+    # 終端なので、ここが日付境界で変わると深夜0時に不要な再作成が起きる。
+    before_midnight = _dt(23, 0)
+    after_midnight = _dt(2, 0, day=2)
+    result_before = stream_scheduler.current_night_sun_times(
+        LATITUDE, LONGITUDE, JST, before_midnight
+    )
+    result_after = stream_scheduler.current_night_sun_times(
+        LATITUDE, LONGITUDE, JST, after_midnight
+    )
+    assert result_before == result_after
+
+
 def _config():
     return {
         "camera_index": 0,
@@ -186,7 +230,9 @@ def test_main_starts_broadcast_and_encoder_during_active_segment(monkeypatch):
     # 差し替える。モジュール全体を patch すると、同じファイル内の compute_segments が
     # 使う datetime.timedelta まで MagicMock になり、main() 内の比較
     # (s[0] <= now < s[1]) が実際の datetime と MagicMock の比較になって壊れる。
-    with patch.object(stream_scheduler, "today_sun_times", return_value=(sunrise, sunset)), \
+    with patch.object(
+             stream_scheduler, "current_night_sun_times", return_value=(sunset, sunrise)
+         ), \
          patch("stream_scheduler.datetime.datetime") as mock_datetime_cls, \
          patch.object(stream_scheduler.youtube_broadcast, "build_youtube_client", return_value=youtube_client), \
          patch.object(stream_scheduler.youtube_broadcast, "find_stream_id", return_value="stream-1"), \
@@ -230,7 +276,9 @@ def test_main_logs_and_continues_when_create_broadcast_fails(monkeypatch, capsys
             handler = signal.getsignal(signal.SIGTERM)
             handler(signal.SIGTERM, None)
 
-    with patch.object(stream_scheduler, "today_sun_times", return_value=(sunrise, sunset)), \
+    with patch.object(
+             stream_scheduler, "current_night_sun_times", return_value=(sunset, sunrise)
+         ), \
          patch("stream_scheduler.datetime.datetime") as mock_datetime_cls, \
          patch.object(stream_scheduler.youtube_broadcast, "build_youtube_client", return_value=MagicMock()), \
          patch.object(stream_scheduler.youtube_broadcast, "find_stream_id", return_value="stream-1"), \
@@ -257,3 +305,232 @@ def test_main_logs_and_continues_when_create_broadcast_fails(monkeypatch, capsys
     mock_start.assert_not_called()  # broadcast作成が失敗し続けたのでエンコーダは一度も起動しない
     captured = capsys.readouterr()
     assert "error" in captured.err.lower()
+
+
+def _sleep_n_times_then_sigterm(n):
+    """time.sleep の差し替え用: n 回目の呼び出しで SIGTERM を配送する。"""
+    call_count = {"n": 0}
+
+    def _sleep(_seconds):
+        call_count["n"] += 1
+        if call_count["n"] >= n:
+            handler = signal.getsignal(signal.SIGTERM)
+            handler(signal.SIGTERM, None)
+
+    return _sleep
+
+
+def test_main_stops_and_retries_when_wait_for_live_times_out(monkeypatch):
+    """wait_for_live が timeout (False) を返したら一度停止し、次のポーリングサイクルで
+    broadcast 作成からやり直す（再試行する）ことを確認する。
+    """
+    _set_required_env(monkeypatch)
+
+    now = _dt(23, 0)  # 常に夜間（アクティブなセグメント内）になる時刻に固定
+    sunset = _dt(19, 0)
+    sunrise = _dt(5, 0, day=2)
+
+    rpicam_proc = MagicMock()
+    ffmpeg_proc = MagicMock()
+
+    original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+    with patch.object(
+             stream_scheduler, "current_night_sun_times", return_value=(sunset, sunrise)
+         ), \
+         patch("stream_scheduler.datetime.datetime") as mock_datetime_cls, \
+         patch.object(stream_scheduler.youtube_broadcast, "build_youtube_client", return_value=MagicMock()), \
+         patch.object(stream_scheduler.youtube_broadcast, "find_stream_id", return_value="stream-1"), \
+         patch.object(stream_scheduler.youtube_broadcast, "create_broadcast", return_value="bcast-1") as mock_create, \
+         patch.object(
+             stream_scheduler.youtube_broadcast, "wait_for_live", side_effect=[False, True]
+         ), \
+         patch.object(stream_scheduler, "start_encoder", return_value=(rpicam_proc, ffmpeg_proc)) as mock_start, \
+         patch.object(stream_scheduler, "stop_encoder") as mock_stop, \
+         patch.object(stream_scheduler, "encoder_is_alive", return_value=True), \
+         patch.object(stream_scheduler.time, "sleep", _sleep_n_times_then_sigterm(2)):
+
+        mock_datetime_cls.now.return_value = now
+
+        try:
+            with pytest.raises(SystemExit):
+                stream_scheduler.main()
+        finally:
+            signal.signal(signal.SIGTERM, original_sigterm_handler)
+
+    # 1回目: create_broadcast -> start_encoder -> wait_for_live=False -> stop_encoder。
+    # 2回目: 同じアクティブセグメント内で再度 create_broadcast -> start_encoder（再試行）。
+    assert mock_create.call_count == 2
+    assert mock_start.call_count == 2
+    # 1回目の timeout による停止 + finally での後始末（2回目は wait_for_live=True で
+    # 生存したまま SIGTERM を受けるので finally で止まる）で計2回。
+    assert mock_stop.call_count == 2
+
+
+def test_main_restarts_encoder_within_same_segment_when_crashed(monkeypatch):
+    """配信時間帯中にエンコーダがクラッシュ（encoder_is_alive が False）したら、
+    同じセグメント内で broadcast を作り直さず start_encoder だけを再度呼んで
+    再起動することを確認する（stop_encoder を挟まない現行の挙動）。
+    """
+    _set_required_env(monkeypatch)
+
+    now = _dt(23, 0)  # 常に夜間・同一セグメント内になる時刻に固定
+    sunset = _dt(19, 0)
+    sunrise = _dt(5, 0, day=2)
+
+    rpicam_proc = MagicMock()
+    ffmpeg_proc = MagicMock()
+
+    original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+    with patch.object(
+             stream_scheduler, "current_night_sun_times", return_value=(sunset, sunrise)
+         ), \
+         patch("stream_scheduler.datetime.datetime") as mock_datetime_cls, \
+         patch.object(stream_scheduler.youtube_broadcast, "build_youtube_client", return_value=MagicMock()), \
+         patch.object(stream_scheduler.youtube_broadcast, "find_stream_id", return_value="stream-1"), \
+         patch.object(stream_scheduler.youtube_broadcast, "create_broadcast", return_value="bcast-1") as mock_create, \
+         patch.object(stream_scheduler.youtube_broadcast, "wait_for_live", return_value=True), \
+         patch.object(stream_scheduler, "start_encoder", return_value=(rpicam_proc, ffmpeg_proc)) as mock_start, \
+         patch.object(stream_scheduler, "stop_encoder") as mock_stop, \
+         patch.object(stream_scheduler, "encoder_is_alive", side_effect=[False]) as mock_alive, \
+         patch.object(stream_scheduler.time, "sleep", _sleep_n_times_then_sigterm(2)):
+
+        mock_datetime_cls.now.return_value = now
+
+        try:
+            with pytest.raises(SystemExit):
+                stream_scheduler.main()
+        finally:
+            signal.signal(signal.SIGTERM, original_sigterm_handler)
+
+    # broadcast は最初の1回だけ（クラッシュ再起動では作り直さない）。
+    assert mock_create.call_count == 1
+    # 初回起動 + クラッシュ後の再起動で計2回。
+    assert mock_start.call_count == 2
+    mock_alive.assert_called_once()
+    # クラッシュ再起動は stop_encoder を挟まない。SIGTERM 後の finally で1回だけ呼ばれる。
+    assert mock_stop.call_count == 1
+
+
+def test_main_stops_encoder_when_leaving_active_window(monkeypatch):
+    """配信時間帯（アクティブセグメント）を外れたら、稼働中のエンコーダを停止することを
+    確認する。1回目は夜間で起動し、2回目は日中（時間帯外）になって停止し、3回目に
+    再び夜間へ戻って broadcast が作り直されることまで確認する。
+
+    2回目で SIGTERM すると、正しい実装（外れたら止めて状態をリセットする）と誤った
+    実装（何もせず古いエンコーダを握ったまま）のどちらも finally で1回だけ
+    stop_encoder を呼ぶ形になり区別が付かない。3回目まで進め、再びアクティブに
+    戻ったときに broadcast が実際に作り直された（create_broadcast / start_encoder が
+    2回目呼ばれた）ことまで観測して初めて区別できる。
+    """
+    _set_required_env(monkeypatch)
+
+    now_active = _dt(23, 0)  # 夜間（アクティブ）
+    now_outside = _dt(6, 0, day=2)  # 日の出後（時間帯外）
+    now_active_again = _dt(23, 0, day=2)  # 翌晩、再びアクティブ
+
+    # patch context に入ると stream_scheduler.datetime（datetime モジュールそのもの）の
+    # datetime クラスが差し替わるため、_dt() を使った datetime 構築は patch の外で
+    # 済ませておく（同じ理由が既存テストのコメントにもある）。
+    night1_sunrise_boundary = _dt(5, 0, day=2)
+    night1 = (_dt(19, 0), _dt(5, 0, day=2))
+    night2 = (_dt(19, 0, day=2), _dt(5, 0, day=3))
+
+    rpicam_proc = MagicMock()
+    ffmpeg_proc = MagicMock()
+
+    original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+    def _fake_current_night_sun_times(latitude, longitude, tz, now):
+        # 実装と同じ「now を含む夜」の判定を模す: 6:00(日の出後)は当夜(day1)に含まれず、
+        # 23:00 はどちらの日も当夜のセグメントを作る。
+        if now < night1_sunrise_boundary:
+            return night1
+        return night2
+
+    with patch.object(
+             stream_scheduler,
+             "current_night_sun_times",
+             side_effect=_fake_current_night_sun_times,
+         ), \
+         patch("stream_scheduler.datetime.datetime") as mock_datetime_cls, \
+         patch.object(stream_scheduler.youtube_broadcast, "build_youtube_client", return_value=MagicMock()), \
+         patch.object(stream_scheduler.youtube_broadcast, "find_stream_id", return_value="stream-1"), \
+         patch.object(stream_scheduler.youtube_broadcast, "create_broadcast", return_value="bcast-1") as mock_create, \
+         patch.object(stream_scheduler.youtube_broadcast, "wait_for_live", return_value=True), \
+         patch.object(stream_scheduler, "start_encoder", return_value=(rpicam_proc, ffmpeg_proc)) as mock_start, \
+         patch.object(stream_scheduler, "stop_encoder") as mock_stop, \
+         patch.object(stream_scheduler, "encoder_is_alive", return_value=True), \
+         patch.object(stream_scheduler.time, "sleep", _sleep_n_times_then_sigterm(3)):
+
+        mock_datetime_cls.now.side_effect = [now_active, now_outside, now_active_again]
+
+        try:
+            with pytest.raises(SystemExit):
+                stream_scheduler.main()
+        finally:
+            signal.signal(signal.SIGTERM, original_sigterm_handler)
+
+    # 1回目のアクティブ + 時間帯外を経て翌晩再びアクティブになったときの、計2回。
+    assert mock_create.call_count == 2
+    assert mock_start.call_count == 2
+    # 時間帯外に出たときの停止 + SIGTERM 後の finally での後始末で計2回。
+    assert mock_stop.call_count == 2
+
+
+def test_main_stops_at_segment_boundary_without_immediate_restart(monkeypatch):
+    """セグメント境界（分割点）をまたいだら一度停止し、同じポーリングサイクル内では
+    再起動せず、次のサイクルで新しいセグメントとして再作成されることを確認する。
+    MAX_SEGMENT_HOURS を短くして夜を2セグメントに分割し、境界（0時）をまたがせる。
+
+    境界をまたいだ直後に SIGTERM すると、正しい実装（一度止めて次サイクルで再作成）と
+    誤った実装（何もせず古いエンコーダを握ったまま）のどちらも finally で1回だけ
+    stop_encoder を呼ぶ形になり区別が付かない。区別するには境界をまたいだサイクルの
+    "次" のサイクルまで進め、broadcast が実際に作り直された（create_broadcast /
+    start_encoder が2回目呼ばれた）ことまで観測する必要がある。
+    """
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("MAX_SEGMENT_HOURS", "5")  # 10時間の夜 -> 5時間ずつ2分割
+
+    now_segment1 = _dt(23, 0)  # 1つ目のセグメント（19:00〜0:00）内
+    now_segment2_boundary = _dt(0, 30, day=2)  # 2つ目のセグメント内、境界をまたいだ直後
+    now_segment2_after_restart = _dt(0, 31, day=2)  # 同じセグメント内、再作成後
+    sunset = _dt(19, 0)
+    sunrise = _dt(5, 0, day=2)
+
+    rpicam_proc = MagicMock()
+    ffmpeg_proc = MagicMock()
+
+    original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+    with patch.object(
+             stream_scheduler, "current_night_sun_times", return_value=(sunset, sunrise)
+         ), \
+         patch("stream_scheduler.datetime.datetime") as mock_datetime_cls, \
+         patch.object(stream_scheduler.youtube_broadcast, "build_youtube_client", return_value=MagicMock()), \
+         patch.object(stream_scheduler.youtube_broadcast, "find_stream_id", return_value="stream-1"), \
+         patch.object(stream_scheduler.youtube_broadcast, "create_broadcast", return_value="bcast-1") as mock_create, \
+         patch.object(stream_scheduler.youtube_broadcast, "wait_for_live", return_value=True), \
+         patch.object(stream_scheduler, "start_encoder", return_value=(rpicam_proc, ffmpeg_proc)) as mock_start, \
+         patch.object(stream_scheduler, "stop_encoder") as mock_stop, \
+         patch.object(stream_scheduler, "encoder_is_alive", return_value=True), \
+         patch.object(stream_scheduler.time, "sleep", _sleep_n_times_then_sigterm(3)):
+
+        mock_datetime_cls.now.side_effect = [
+            now_segment1,
+            now_segment2_boundary,
+            now_segment2_after_restart,
+        ]
+
+        try:
+            with pytest.raises(SystemExit):
+                stream_scheduler.main()
+        finally:
+            signal.signal(signal.SIGTERM, original_sigterm_handler)
+
+    # セグメント1で1回、境界をまたいで停止した後の次サイクルで1回、計2回作り直す。
+    assert mock_create.call_count == 2
+    assert mock_start.call_count == 2
+    # 境界をまたいだときの停止 + SIGTERM 後の finally での後始末で計2回。
+    assert mock_stop.call_count == 2
