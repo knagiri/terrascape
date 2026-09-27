@@ -28,7 +28,19 @@ def main():
         }
     }
     flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
-    credentials = flow.run_local_server(port=0)
+    # prompt="consent" を明示する: 同じ Google アカウント・同じ client で認可をやり直すと、
+    # Google は既に付与済みとみなして refresh_token を返さないことがある
+    # （access_type=offline は既定で付くが prompt はそれだけでは consent にならない）。
+    # 常に consent 画面を強制することで refresh_token の取りこぼしを防ぐ。
+    credentials = flow.run_local_server(port=0, prompt="consent")
+
+    if not credentials.refresh_token:
+        print(
+            "エラー: refresh_token が取得できませんでした。"
+            "Google アカウントの設定でこのアプリのアクセス権を一度取り消してから再実行してください。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     print("認可に成功しました。以下を .env の YOUTUBE_REFRESH_TOKEN に設定してください:")
     print(credentials.refresh_token)
