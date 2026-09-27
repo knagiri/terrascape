@@ -220,10 +220,15 @@ def main():
                         ffmpeg_proc = None
                         current_segment_end = None
                     elif not encoder_is_alive(rpicam_proc, ffmpeg_proc):
-                        # 配信時間帯中にクラッシュした。同じセグメント内で再起動する。
-                        rpicam_proc, ffmpeg_proc = start_encoder(
-                            config, _build_rtmp_url(config["youtube_stream_key"])
-                        )
+                        # 配信時間帯中にクラッシュした。broadcast は enableAutoStop なので、
+                        # 検知までの間に complete になっていることがあり、encoder だけ
+                        # 再起動すると live な broadcast の無い stream へ送り続けてしまう。
+                        # 一度止めて状態を戻し、次のポーリングサイクルで broadcast 作成から
+                        # やり直す（生き残った片方の process もここで後始末する）。
+                        stop_encoder(rpicam_proc, ffmpeg_proc)
+                        rpicam_proc = None
+                        ffmpeg_proc = None
+                        current_segment_end = None
                 except Exception as exc:
                     # YouTube API のネットワークエラー・トークン失効等はここで捕まえ、
                     # プロセス全体をクラッシュさせず次のポーリングサイクルでリトライする

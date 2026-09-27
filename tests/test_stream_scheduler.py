@@ -367,10 +367,12 @@ def test_main_stops_and_retries_when_wait_for_live_times_out(monkeypatch):
     assert mock_stop.call_count == 2
 
 
-def test_main_restarts_encoder_within_same_segment_when_crashed(monkeypatch):
-    """配信時間帯中にエンコーダがクラッシュ（encoder_is_alive が False）したら、
-    同じセグメント内で broadcast を作り直さず start_encoder だけを再度呼んで
-    再起動することを確認する（stop_encoder を挟まない現行の挙動）。
+def test_main_recreates_broadcast_when_encoder_crashed(monkeypatch):
+    """配信時間帯中にエンコーダがクラッシュ（encoder_is_alive が False）したら、一度停止して
+    状態を戻し、次のポーリングサイクルで broadcast 作成からやり直すことを確認する。
+    create_broadcast は enableAutoStop=True なので、クラッシュ検知までの間に broadcast が
+    complete になっていることがあり、同じ broadcast のまま encoder だけ再起動すると
+    live な broadcast の無い stream へ送り続けてしまう。
     """
     _set_required_env(monkeypatch)
 
@@ -394,7 +396,7 @@ def test_main_restarts_encoder_within_same_segment_when_crashed(monkeypatch):
          patch.object(stream_scheduler, "start_encoder", return_value=(rpicam_proc, ffmpeg_proc)) as mock_start, \
          patch.object(stream_scheduler, "stop_encoder") as mock_stop, \
          patch.object(stream_scheduler, "encoder_is_alive", side_effect=[False]) as mock_alive, \
-         patch.object(stream_scheduler.time, "sleep", _sleep_n_times_then_sigterm(2)):
+         patch.object(stream_scheduler.time, "sleep", _sleep_n_times_then_sigterm(3)):
 
         mock_datetime_cls.now.return_value = now
 
@@ -404,13 +406,12 @@ def test_main_restarts_encoder_within_same_segment_when_crashed(monkeypatch):
         finally:
             signal.signal(signal.SIGTERM, original_sigterm_handler)
 
-    # broadcast は最初の1回だけ（クラッシュ再起動では作り直さない）。
-    assert mock_create.call_count == 1
-    # 初回起動 + クラッシュ後の再起動で計2回。
-    assert mock_start.call_count == 2
     mock_alive.assert_called_once()
-    # クラッシュ再起動は stop_encoder を挟まない。SIGTERM 後の finally で1回だけ呼ばれる。
-    assert mock_stop.call_count == 1
+    # 初回 + クラッシュ後の次サイクルで broadcast 作成からやり直すので、どちらも2回。
+    assert mock_create.call_count == 2
+    assert mock_start.call_count == 2
+    # クラッシュ検知時の停止（生き残った片方の後始末）+ SIGTERM 後の finally で計2回。
+    assert mock_stop.call_count == 2
 
 
 def test_main_stops_encoder_when_leaving_active_window(monkeypatch):
