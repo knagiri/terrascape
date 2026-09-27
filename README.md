@@ -80,7 +80,9 @@ set -a; . ./.env; set +a
 ```bash
 sudo systemctl disable --now terrascape-stream
 sudo rm /etc/systemd/system/terrascape-stream.service
-diff .env.example .env   # 不足しているキーを確認し、.env に追記する
+# キー名だけを比較する（素の diff は .env 側の値をそのまま出力し、上で戒めている
+# シークレットの terminal/journal 露出に自ら反する）
+diff <(cut -d= -f1 .env.example | sort) <(cut -d= -f1 .env | sort)   # 不足しているキー名を確認し、.env に追記する
 sudo ln -s ~/terrascape/systemd/terrascape-stream-scheduler.service /etc/systemd/system/
 sudo systemctl daemon-reload
 ```
