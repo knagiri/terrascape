@@ -65,18 +65,27 @@ def start_encoder(config, rtmp_url, popen_fn=subprocess.Popen):
     """rpicam-vid | ffmpeg のパイプラインを起動し、両方の Popen を返す。"""
     rpicam_proc = popen_fn(build_rpicam_command(config), stdout=subprocess.PIPE)
     ffmpeg_proc = popen_fn(build_ffmpeg_command(config, rtmp_url), stdin=rpicam_proc.stdout)
-    # ffmpeg 側にも同じ fd への参照を持たせたまま閉じないと、rpicam-vid が終了しても
-    # ffmpeg 側の読み取り端が残り続けて SIGPIPE が伝わらない。
+    # 親プロセスが読み取り端を持ったまま閉じないと、ffmpeg が先に終了したときに
+    # 読み取り端が閉じきらず rpicam-vid が書き込みで SIGPIPE を受け取れずブロックし続ける。
     rpicam_proc.stdout.close()
     return rpicam_proc, ffmpeg_proc
 
 
 def stop_encoder(rpicam_proc, ffmpeg_proc, timeout_seconds=10):
-    """パイプラインを graceful に終了させる。"""
+    """パイプラインを graceful に終了させる。
+
+    terminate 後の wait がタイムアウトしたプロセスは kill してから改めて wait する。
+    片方が TimeoutExpired を投げても、そこで打ち切らずもう片方の後始末を続ける
+    （でないと片方が残り続け、次回の start_encoder がカメラを掴めない等の不具合になる）。
+    """
     rpicam_proc.terminate()
     ffmpeg_proc.terminate()
-    rpicam_proc.wait(timeout=timeout_seconds)
-    ffmpeg_proc.wait(timeout=timeout_seconds)
+    for proc in (rpicam_proc, ffmpeg_proc):
+        try:
+            proc.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
 
 def encoder_is_alive(rpicam_proc, ffmpeg_proc):

@@ -1,4 +1,5 @@
 import datetime
+import subprocess
 import zoneinfo
 from unittest.mock import MagicMock
 
@@ -96,6 +97,28 @@ def test_stop_encoder_terminates_and_waits_both_processes():
     ffmpeg_proc.terminate.assert_called_once()
     rpicam_proc.wait.assert_called_once_with(timeout=5)
     ffmpeg_proc.wait.assert_called_once_with(timeout=5)
+
+
+def test_stop_encoder_kills_and_waits_process_when_wait_times_out():
+    rpicam_proc = MagicMock()
+    # 1回目(timeout付き)だけ TimeoutExpired、kill 後の2回目(引数無し)の wait は正常終了させる
+    rpicam_proc.wait.side_effect = [
+        subprocess.TimeoutExpired(cmd="rpicam-vid", timeout=5),
+        None,
+    ]
+    ffmpeg_proc = MagicMock()
+
+    stream_scheduler.stop_encoder(rpicam_proc, ffmpeg_proc, timeout_seconds=5)
+
+    rpicam_proc.kill.assert_called_once()
+    # 1回目: timeout 付きの wait（TimeoutExpired）、2回目: kill 後の引数無し wait
+    assert rpicam_proc.wait.call_count == 2
+    rpicam_proc.wait.assert_any_call(timeout=5)
+    rpicam_proc.wait.assert_any_call()
+    # rpicam 側が timeout してもう片方の後始末は飛ばさない
+    ffmpeg_proc.terminate.assert_called_once()
+    ffmpeg_proc.wait.assert_called_once_with(timeout=5)
+    ffmpeg_proc.kill.assert_not_called()
 
 
 def test_encoder_is_alive_false_when_either_process_exited():
