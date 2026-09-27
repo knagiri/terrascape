@@ -1,0 +1,115 @@
+from unittest.mock import MagicMock, call
+
+import youtube_broadcast
+
+
+def _make_youtube_mock():
+    return MagicMock()
+
+
+def test_find_stream_id_matches_stream_key():
+    youtube = _make_youtube_mock()
+    youtube.liveStreams().list.return_value.execute.return_value = {
+        "items": [
+            {"id": "stream-1", "cdn": {"ingestionInfo": {"streamName": "other-key"}}},
+            {"id": "stream-2", "cdn": {"ingestionInfo": {"streamName": "my-key"}}},
+        ]
+    }
+    youtube.liveStreams().list_next.return_value = None
+
+    result = youtube_broadcast.find_stream_id(youtube, "my-key")
+
+    assert result == "stream-2"
+
+
+def test_find_stream_id_returns_none_when_not_found():
+    youtube = _make_youtube_mock()
+    youtube.liveStreams().list.return_value.execute.return_value = {"items": []}
+    youtube.liveStreams().list_next.return_value = None
+
+    result = youtube_broadcast.find_stream_id(youtube, "missing-key")
+
+    assert result is None
+
+
+def test_create_broadcast_inserts_binds_and_transitions():
+    youtube = _make_youtube_mock()
+    youtube.liveBroadcasts().insert.return_value.execute.return_value = {"id": "bcast-1"}
+
+    broadcast_id = youtube_broadcast.create_broadcast(
+        youtube, stream_id="stream-2", title="Terrascape Live", privacy_status="unlisted"
+    )
+
+    assert broadcast_id == "bcast-1"
+    insert_kwargs = youtube.liveBroadcasts().insert.call_args.kwargs
+    assert insert_kwargs["body"]["contentDetails"]["enableAutoStart"] is True
+    assert insert_kwargs["body"]["contentDetails"]["enableAutoStop"] is True
+    assert insert_kwargs["body"]["status"]["privacyStatus"] == "unlisted"
+
+    youtube.liveBroadcasts().bind.assert_called_with(
+        id="bcast-1", part="id", streamId="stream-2"
+    )
+    youtube.liveBroadcasts().transition.assert_called_with(
+        broadcastStatus="testing", id="bcast-1", part="status"
+    )
+
+
+def test_get_lifecycle_status_returns_status_field():
+    youtube = _make_youtube_mock()
+    youtube.liveBroadcasts().list.return_value.execute.return_value = {
+        "items": [{"status": {"lifeCycleStatus": "live"}}]
+    }
+
+    result = youtube_broadcast.get_lifecycle_status(youtube, "bcast-1")
+
+    assert result == "live"
+
+
+def test_wait_for_live_returns_true_once_live():
+    youtube = _make_youtube_mock()
+    statuses = iter(["testing", "testing", "live"])
+    youtube.liveBroadcasts().list.return_value.execute.side_effect = [
+        {"items": [{"status": {"lifeCycleStatus": s}}]} for s in ["testing", "testing", "live"]
+    ]
+    sleep_calls = []
+
+    result = youtube_broadcast.wait_for_live(
+        youtube, "bcast-1", timeout_seconds=100, poll_interval_seconds=1,
+        sleep_fn=sleep_calls.append,
+    )
+
+    assert result is True
+    assert len(sleep_calls) == 2  # live になる前に2回ポーリング待機した
+
+
+def test_wait_for_live_returns_false_on_timeout():
+    youtube = _make_youtube_mock()
+    youtube.liveBroadcasts().list.return_value.execute.return_value = {
+        "items": [{"status": {"lifeCycleStatus": "testing"}}]
+    }
+    call_count = {"n": 0}
+
+    def fake_sleep(_seconds):
+        call_count["n"] += 1
+        if call_count["n"] > 5:
+            raise AssertionError("timeout で止まらずポーリングし続けている")
+
+    import time as time_module
+    original_monotonic = time_module.monotonic
+    times = iter([0, 1, 2, 3, 200])  # 4回目のチェックで timeout_seconds=100 を超える
+
+    def fake_monotonic():
+        return next(times, 999)
+
+    import youtube_broadcast as yb
+    orig = yb.time.monotonic
+    yb.time.monotonic = fake_monotonic
+    try:
+        result = yb.wait_for_live(
+            youtube, "bcast-1", timeout_seconds=100, poll_interval_seconds=1,
+            sleep_fn=fake_sleep,
+        )
+    finally:
+        yb.time.monotonic = orig
+
+    assert result is False
