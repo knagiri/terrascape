@@ -181,6 +181,20 @@ def main():
     ffmpeg_proc = None
     current_segment_end = None
 
+    def stop_and_clear():
+        """encoder を止め、rpicam_proc/ffmpeg_proc/current_segment_end を None に戻す。
+
+        分岐が増えるたびに『stop_encoder → 3変数を None に戻す』を書き並べると
+        取りこぼしやすい（実際、transition_to_testing 等が start_encoder の後ろに
+        移った際にこの後始末が抜け、encoder を起動したまま例外を外側の except に
+        投げてしまう不具合があった）。ヘルパーに一本化してその種の抜けを防ぐ。
+        """
+        nonlocal rpicam_proc, ffmpeg_proc, current_segment_end
+        stop_encoder(rpicam_proc, ffmpeg_proc)
+        rpicam_proc = None
+        ffmpeg_proc = None
+        current_segment_end = None
+
     try:
         while True:
             now = datetime.datetime.now(tz)
@@ -203,60 +217,65 @@ def main():
                             config, _build_rtmp_url(config["youtube_stream_key"])
                         )
                         current_segment_end = active_segment[1]
-                        if not youtube_broadcast.wait_for_stream_active(
-                            youtube,
-                            stream_id,
-                            WAIT_FOR_STREAM_ACTIVE_TIMEOUT_SECONDS,
-                            WAIT_FOR_STREAM_ACTIVE_POLL_INTERVAL_SECONDS,
-                        ):
+                        try:
+                            stream_active = youtube_broadcast.wait_for_stream_active(
+                                youtube,
+                                stream_id,
+                                WAIT_FOR_STREAM_ACTIVE_TIMEOUT_SECONDS,
+                                WAIT_FOR_STREAM_ACTIVE_POLL_INTERVAL_SECONDS,
+                            )
+                        except Exception:
+                            # wait_for_stream_active 自体が例外（API エラー等）を投げても、
+                            # encoder を起動したまま放置しない。下の except Exception で
+                            # ログしてリトライできるよう、ここで一度止めてから re-raise する。
+                            stop_and_clear()
+                            raise
+                        if not stream_active:
                             # stream が active にならなかった。一度止めて次のポーリング
                             # サイクルで再試行する。
-                            stop_encoder(rpicam_proc, ffmpeg_proc)
-                            rpicam_proc = None
-                            ffmpeg_proc = None
-                            current_segment_end = None
+                            stop_and_clear()
                         else:
-                            youtube_broadcast.transition_to_testing(youtube, broadcast_id)
-                            if not youtube_broadcast.wait_for_live(
-                                youtube,
-                                broadcast_id,
-                                WAIT_FOR_LIVE_TIMEOUT_SECONDS,
-                                WAIT_FOR_LIVE_POLL_INTERVAL_SECONDS,
-                            ):
+                            # transition_to_testing / wait_for_live も同様に、例外を
+                            # 投げたら encoder を張り付けたまま次サイクルへ渡さない。
+                            # ここで一度止めてから re-raise し、外側の except Exception で
+                            # ログして次のポーリングサイクルで broadcast 作成からやり直す。
+                            try:
+                                youtube_broadcast.transition_to_testing(youtube, broadcast_id)
+                                live = youtube_broadcast.wait_for_live(
+                                    youtube,
+                                    broadcast_id,
+                                    WAIT_FOR_LIVE_TIMEOUT_SECONDS,
+                                    WAIT_FOR_LIVE_POLL_INTERVAL_SECONDS,
+                                )
+                            except Exception:
+                                stop_and_clear()
+                                raise
+                            if not live:
                                 # live にならなかった。一度止めて次のポーリングサイクルで再試行する。
-                                stop_encoder(rpicam_proc, ffmpeg_proc)
-                                rpicam_proc = None
-                                ffmpeg_proc = None
-                                current_segment_end = None
+                                stop_and_clear()
                     elif current_segment_end != active_segment[1]:
                         # セグメント境界をまたいだ（分割点に到達した）。一度止めて
                         # 次のポーリングサイクルで新しいセグメントとして再作成する。
-                        stop_encoder(rpicam_proc, ffmpeg_proc)
-                        rpicam_proc = None
-                        ffmpeg_proc = None
-                        current_segment_end = None
+                        stop_and_clear()
                     elif not encoder_is_alive(rpicam_proc, ffmpeg_proc):
                         # 配信時間帯中にクラッシュした。broadcast は enableAutoStop なので、
                         # 検知までの間に complete になっていることがあり、encoder だけ
                         # 再起動すると live な broadcast の無い stream へ送り続けてしまう。
                         # 一度止めて状態を戻し、次のポーリングサイクルで broadcast 作成から
                         # やり直す（生き残った片方の process もここで後始末する）。
-                        stop_encoder(rpicam_proc, ffmpeg_proc)
-                        rpicam_proc = None
-                        ffmpeg_proc = None
-                        current_segment_end = None
+                        stop_and_clear()
                 except Exception as exc:
                     # YouTube API のネットワークエラー・トークン失効等はここで捕まえ、
                     # プロセス全体をクラッシュさせず次のポーリングサイクルでリトライする
-                    # （spec の要求どおり）。rpicam_proc が既に起動済みなら状態はそのまま
-                    # 保持し、次のループで encoder_is_alive の分岐に自然に合流する。
+                    # （spec の要求どおり）。wait_for_stream_active 以降（encoder 起動後）の
+                    # 例外は上の stop_and_clear() で既に後始末済みなので、rpicam_proc は
+                    # 常に None に戻っている。create_broadcast / start_encoder 自体が
+                    # 例外を投げた場合のみ、rpicam_proc が None のまま（またはまだ未起動）
+                    # なので次のループでそのまま broadcast 作成から再試行できる。
                     print(f"stream_scheduler: error handling segment: {exc}", file=sys.stderr)
             else:
                 if rpicam_proc is not None:
-                    stop_encoder(rpicam_proc, ffmpeg_proc)
-                    rpicam_proc = None
-                    ffmpeg_proc = None
-                    current_segment_end = None
+                    stop_and_clear()
 
             time.sleep(POLL_INTERVAL_SECONDS)
     finally:

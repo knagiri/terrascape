@@ -449,6 +449,65 @@ def test_main_stops_and_retries_when_stream_never_becomes_active(monkeypatch):
     assert mock_stop.call_count == 2
 
 
+def test_main_stops_encoder_and_retries_when_transition_to_testing_raises(monkeypatch):
+    """transition_to_testing が例外を投げたら、encoder を起動したまま放置せず一度停止し、
+    次のポーリングサイクルで broadcast 作成からやり直すことを確認する。
+
+    transition_to_testing は start_encoder の後ろで呼ばれる。ここで例外（API の
+    一時的なネットワークエラー等）が出ても、外側の except Exception に捕まる前に
+    encoder を停止して rpicam_proc 等を None に戻していないと、次のサイクルは
+    「current_segment_end == active_segment[1] かつ encoder_is_alive=True」の
+    分岐に入ってしまい、live になっていない broadcast へ送り続けたまま
+    max_segment_hours まで何もしない（本テストは修正前のコードでは落ちる）。
+    """
+    _set_required_env(monkeypatch)
+
+    now = _dt(23, 0)  # 常に夜間（アクティブなセグメント内）になる時刻に固定
+    sunset = _dt(19, 0)
+    sunrise = _dt(5, 0, day=2)
+
+    rpicam_proc = MagicMock()
+    ffmpeg_proc = MagicMock()
+
+    original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+    with patch.object(
+             stream_scheduler, "current_night_sun_times", return_value=(sunset, sunrise)
+         ), \
+         patch("stream_scheduler.datetime.datetime") as mock_datetime_cls, \
+         patch.object(stream_scheduler.youtube_broadcast, "build_youtube_client", return_value=MagicMock()), \
+         patch.object(stream_scheduler.youtube_broadcast, "find_stream_id", return_value="stream-1"), \
+         patch.object(stream_scheduler.youtube_broadcast, "create_broadcast", return_value="bcast-1") as mock_create, \
+         patch.object(stream_scheduler.youtube_broadcast, "wait_for_stream_active", return_value=True), \
+         patch.object(
+             stream_scheduler.youtube_broadcast,
+             "transition_to_testing",
+             side_effect=[RuntimeError("network error"), None],
+         ) as mock_transition, \
+         patch.object(stream_scheduler.youtube_broadcast, "wait_for_live", return_value=True), \
+         patch.object(stream_scheduler, "start_encoder", return_value=(rpicam_proc, ffmpeg_proc)) as mock_start, \
+         patch.object(stream_scheduler, "stop_encoder") as mock_stop, \
+         patch.object(stream_scheduler, "encoder_is_alive", return_value=True), \
+         patch.object(stream_scheduler.time, "sleep", _sleep_n_times_then_sigterm(2)):
+
+        mock_datetime_cls.now.return_value = now
+
+        try:
+            with pytest.raises(SystemExit):
+                stream_scheduler.main()
+        finally:
+            signal.signal(signal.SIGTERM, original_sigterm_handler)
+
+    # 1回目: transition_to_testing が例外 -> encoder を停止して broadcast 作成からやり直す。
+    # 2回目: 同じアクティブセグメント内で再度 create_broadcast -> start_encoder（再試行）。
+    assert mock_create.call_count == 2
+    assert mock_start.call_count == 2
+    assert mock_transition.call_count == 2
+    # 1回目の例外による停止 + finally での後始末（2回目は正常に live になり生存したまま
+    # SIGTERM を受けるので finally で止まる）で計2回。
+    assert mock_stop.call_count == 2
+
+
 def test_main_recreates_broadcast_when_encoder_crashed(monkeypatch):
     """配信時間帯中にエンコーダがクラッシュ（encoder_is_alive が False）したら、一度停止して
     状態を戻し、次のポーリングサイクルで broadcast 作成からやり直すことを確認する。
