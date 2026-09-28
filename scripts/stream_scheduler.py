@@ -17,6 +17,8 @@ import youtube_broadcast
 POLL_INTERVAL_SECONDS = 60
 WAIT_FOR_LIVE_TIMEOUT_SECONDS = 180
 WAIT_FOR_LIVE_POLL_INTERVAL_SECONDS = 10
+WAIT_FOR_STREAM_ACTIVE_TIMEOUT_SECONDS = 60
+WAIT_FOR_STREAM_ACTIVE_POLL_INTERVAL_SECONDS = 5
 
 
 def load_config():
@@ -201,17 +203,31 @@ def main():
                             config, _build_rtmp_url(config["youtube_stream_key"])
                         )
                         current_segment_end = active_segment[1]
-                        if not youtube_broadcast.wait_for_live(
+                        if not youtube_broadcast.wait_for_stream_active(
                             youtube,
-                            broadcast_id,
-                            WAIT_FOR_LIVE_TIMEOUT_SECONDS,
-                            WAIT_FOR_LIVE_POLL_INTERVAL_SECONDS,
+                            stream_id,
+                            WAIT_FOR_STREAM_ACTIVE_TIMEOUT_SECONDS,
+                            WAIT_FOR_STREAM_ACTIVE_POLL_INTERVAL_SECONDS,
                         ):
-                            # live にならなかった。一度止めて次のポーリングサイクルで再試行する。
+                            # stream が active にならなかった。一度止めて次のポーリング
+                            # サイクルで再試行する。
                             stop_encoder(rpicam_proc, ffmpeg_proc)
                             rpicam_proc = None
                             ffmpeg_proc = None
                             current_segment_end = None
+                        else:
+                            youtube_broadcast.transition_to_testing(youtube, broadcast_id)
+                            if not youtube_broadcast.wait_for_live(
+                                youtube,
+                                broadcast_id,
+                                WAIT_FOR_LIVE_TIMEOUT_SECONDS,
+                                WAIT_FOR_LIVE_POLL_INTERVAL_SECONDS,
+                            ):
+                                # live にならなかった。一度止めて次のポーリングサイクルで再試行する。
+                                stop_encoder(rpicam_proc, ffmpeg_proc)
+                                rpicam_proc = None
+                                ffmpeg_proc = None
+                                current_segment_end = None
                     elif current_segment_end != active_segment[1]:
                         # セグメント境界をまたいだ（分割点に到達した）。一度止めて
                         # 次のポーリングサイクルで新しいセグメントとして再作成する。
