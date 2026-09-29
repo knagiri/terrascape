@@ -237,8 +237,6 @@ def test_main_starts_broadcast_and_encoder_during_active_segment(monkeypatch):
          patch.object(stream_scheduler.youtube_broadcast, "build_youtube_client", return_value=youtube_client), \
          patch.object(stream_scheduler.youtube_broadcast, "find_stream_id", return_value="stream-1"), \
          patch.object(stream_scheduler.youtube_broadcast, "create_broadcast", return_value="bcast-1") as mock_create, \
-         patch.object(stream_scheduler.youtube_broadcast, "wait_for_stream_active", return_value=True) as mock_wait_active, \
-         patch.object(stream_scheduler.youtube_broadcast, "transition_to_testing") as mock_transition, \
          patch.object(stream_scheduler.youtube_broadcast, "wait_for_live", return_value=True) as mock_wait_live, \
          patch.object(stream_scheduler, "start_encoder", return_value=(rpicam_proc, ffmpeg_proc)) as mock_start, \
          patch.object(stream_scheduler, "stop_encoder") as mock_stop, \
@@ -251,8 +249,6 @@ def test_main_starts_broadcast_and_encoder_during_active_segment(monkeypatch):
         call_order = MagicMock()
         call_order.attach_mock(mock_create, "create_broadcast")
         call_order.attach_mock(mock_start, "start_encoder")
-        call_order.attach_mock(mock_wait_active, "wait_for_stream_active")
-        call_order.attach_mock(mock_transition, "transition_to_testing")
         call_order.attach_mock(mock_wait_live, "wait_for_live")
 
         try:
@@ -264,23 +260,30 @@ def test_main_starts_broadcast_and_encoder_during_active_segment(monkeypatch):
     mock_create.assert_called_once()
     mock_start.assert_called_once()
     mock_stop.assert_called_once_with(rpicam_proc, ffmpeg_proc)
-    # YouTube API は bind した stream が active（エンコーダが送信中）でないと
-    # transition(testing) を拒否するため、エンコーダ起動 -> active 待ち -> testing 遷移
-    # -> live 待ち、の順でなければならない。
+    # create_broadcast は enableAutoStart=True で作るので、stream が active になれば
+    # YouTube 側が自動で live へ遷移させる。手動の transition は呼ばず（呼ぶとこの
+    # 自動遷移と衝突して invalidTransition エラーになる）、エンコーダ起動の直後に
+    # live になるのを待つだけでよい。
     assert [c[0] for c in call_order.mock_calls] == [
         "create_broadcast",
         "start_encoder",
-        "wait_for_stream_active",
-        "transition_to_testing",
         "wait_for_live",
     ]
-    mock_wait_active.assert_called_once_with(
+    mock_wait_live.assert_called_once_with(
         youtube_client,
-        "stream-1",
-        stream_scheduler.WAIT_FOR_STREAM_ACTIVE_TIMEOUT_SECONDS,
-        stream_scheduler.WAIT_FOR_STREAM_ACTIVE_POLL_INTERVAL_SECONDS,
+        "bcast-1",
+        stream_scheduler.WAIT_FOR_LIVE_TIMEOUT_SECONDS,
+        stream_scheduler.WAIT_FOR_LIVE_POLL_INTERVAL_SECONDS,
     )
-    mock_transition.assert_called_once_with(youtube_client, "bcast-1")
+    youtube_client.liveBroadcasts.return_value.transition.assert_not_called()
+
+
+def test_wait_for_live_timeout_allows_slow_auto_start():
+    """autoStart による live 遷移は、ドキュメントの目安（5〜10秒）より大幅に遅いことが
+    実機で確認されている（encoder 起動から90秒経っても ready のままだった）。timeout が
+    短いと live 化の途中で encoder を止めて作り直すのを繰り返すので、10分の余裕を持たせる。
+    """
+    assert stream_scheduler.WAIT_FOR_LIVE_TIMEOUT_SECONDS == 600
 
 
 def test_main_logs_and_continues_when_create_broadcast_fails(monkeypatch, capsys):
@@ -369,8 +372,6 @@ def test_main_stops_and_retries_when_wait_for_live_times_out(monkeypatch):
          patch.object(stream_scheduler.youtube_broadcast, "build_youtube_client", return_value=MagicMock()), \
          patch.object(stream_scheduler.youtube_broadcast, "find_stream_id", return_value="stream-1"), \
          patch.object(stream_scheduler.youtube_broadcast, "create_broadcast", return_value="bcast-1") as mock_create, \
-         patch.object(stream_scheduler.youtube_broadcast, "wait_for_stream_active", return_value=True), \
-         patch.object(stream_scheduler.youtube_broadcast, "transition_to_testing"), \
          patch.object(
              stream_scheduler.youtube_broadcast, "wait_for_live", side_effect=[False, True]
          ), \
@@ -396,69 +397,16 @@ def test_main_stops_and_retries_when_wait_for_live_times_out(monkeypatch):
     assert mock_stop.call_count == 2
 
 
-def test_main_stops_and_retries_when_stream_never_becomes_active(monkeypatch):
-    """wait_for_stream_active が timeout (False) を返したら、transition_to_testing も
-    wait_for_live も呼ばずに一度停止し、次のポーリングサイクルで broadcast 作成から
-    やり直すことを確認する（active でない stream に対する transition は YouTube API が
-    "Invalid transition" で拒否するため、呼んではならない）。
-    """
-    _set_required_env(monkeypatch)
-
-    now = _dt(23, 0)  # 常に夜間（アクティブなセグメント内）になる時刻に固定
-    sunset = _dt(19, 0)
-    sunrise = _dt(5, 0, day=2)
-
-    rpicam_proc = MagicMock()
-    ffmpeg_proc = MagicMock()
-
-    original_sigterm_handler = signal.getsignal(signal.SIGTERM)
-
-    with patch.object(
-             stream_scheduler, "current_night_sun_times", return_value=(sunset, sunrise)
-         ), \
-         patch("stream_scheduler.datetime.datetime") as mock_datetime_cls, \
-         patch.object(stream_scheduler.youtube_broadcast, "build_youtube_client", return_value=MagicMock()), \
-         patch.object(stream_scheduler.youtube_broadcast, "find_stream_id", return_value="stream-1"), \
-         patch.object(stream_scheduler.youtube_broadcast, "create_broadcast", return_value="bcast-1") as mock_create, \
-         patch.object(
-             stream_scheduler.youtube_broadcast, "wait_for_stream_active", return_value=False
-         ) as mock_wait_active, \
-         patch.object(stream_scheduler.youtube_broadcast, "transition_to_testing") as mock_transition, \
-         patch.object(stream_scheduler.youtube_broadcast, "wait_for_live") as mock_wait_live, \
-         patch.object(stream_scheduler, "start_encoder", return_value=(rpicam_proc, ffmpeg_proc)) as mock_start, \
-         patch.object(stream_scheduler, "stop_encoder") as mock_stop, \
-         patch.object(stream_scheduler, "encoder_is_alive", return_value=True), \
-         patch.object(stream_scheduler.time, "sleep", _sleep_n_times_then_sigterm(2)):
-
-        mock_datetime_cls.now.return_value = now
-
-        try:
-            with pytest.raises(SystemExit):
-                stream_scheduler.main()
-        finally:
-            signal.signal(signal.SIGTERM, original_sigterm_handler)
-
-    # 各サイクルで create_broadcast -> start_encoder -> wait_for_stream_active=False ->
-    # stop_encoder を繰り返し、2サイクル目も broadcast 作成からやり直している。
-    assert mock_create.call_count == 2
-    assert mock_start.call_count == 2
-    assert mock_wait_active.call_count == 2
-    mock_transition.assert_not_called()
-    mock_wait_live.assert_not_called()
-    # 両サイクルの停止で計2回。停止後は rpicam_proc=None なので finally では止めない。
-    assert mock_stop.call_count == 2
-
-
-def test_main_stops_encoder_and_retries_when_transition_to_testing_raises(monkeypatch):
-    """transition_to_testing が例外を投げたら、encoder を起動したまま放置せず一度停止し、
+def test_main_stops_encoder_and_retries_when_wait_for_live_raises(monkeypatch):
+    """wait_for_live が例外を投げたら、encoder を起動したまま放置せず一度停止し、
     次のポーリングサイクルで broadcast 作成からやり直すことを確認する。
 
-    transition_to_testing は start_encoder の後ろで呼ばれる。ここで例外（API の
+    wait_for_live は start_encoder の後ろで呼ばれる。ここで例外（API の
     一時的なネットワークエラー等）が出ても、外側の except Exception に捕まる前に
     encoder を停止して rpicam_proc 等を None に戻していないと、次のサイクルは
     「current_segment_end == active_segment[1] かつ encoder_is_alive=True」の
     分岐に入ってしまい、live になっていない broadcast へ送り続けたまま
-    max_segment_hours まで何もしない（本テストは修正前のコードでは落ちる）。
+    max_segment_hours まで何もしない（PR #19 で塞いだ後始末の抜け）。
     """
     _set_required_env(monkeypatch)
 
@@ -478,13 +426,11 @@ def test_main_stops_encoder_and_retries_when_transition_to_testing_raises(monkey
          patch.object(stream_scheduler.youtube_broadcast, "build_youtube_client", return_value=MagicMock()), \
          patch.object(stream_scheduler.youtube_broadcast, "find_stream_id", return_value="stream-1"), \
          patch.object(stream_scheduler.youtube_broadcast, "create_broadcast", return_value="bcast-1") as mock_create, \
-         patch.object(stream_scheduler.youtube_broadcast, "wait_for_stream_active", return_value=True), \
          patch.object(
              stream_scheduler.youtube_broadcast,
-             "transition_to_testing",
-             side_effect=[RuntimeError("network error"), None],
-         ) as mock_transition, \
-         patch.object(stream_scheduler.youtube_broadcast, "wait_for_live", return_value=True), \
+             "wait_for_live",
+             side_effect=[RuntimeError("network error"), True],
+         ) as mock_wait_live, \
          patch.object(stream_scheduler, "start_encoder", return_value=(rpicam_proc, ffmpeg_proc)) as mock_start, \
          patch.object(stream_scheduler, "stop_encoder") as mock_stop, \
          patch.object(stream_scheduler, "encoder_is_alive", return_value=True), \
@@ -498,11 +444,11 @@ def test_main_stops_encoder_and_retries_when_transition_to_testing_raises(monkey
         finally:
             signal.signal(signal.SIGTERM, original_sigterm_handler)
 
-    # 1回目: transition_to_testing が例外 -> encoder を停止して broadcast 作成からやり直す。
+    # 1回目: wait_for_live が例外 -> encoder を停止して broadcast 作成からやり直す。
     # 2回目: 同じアクティブセグメント内で再度 create_broadcast -> start_encoder（再試行）。
     assert mock_create.call_count == 2
     assert mock_start.call_count == 2
-    assert mock_transition.call_count == 2
+    assert mock_wait_live.call_count == 2
     # 1回目の例外による停止 + finally での後始末（2回目は正常に live になり生存したまま
     # SIGTERM を受けるので finally で止まる）で計2回。
     assert mock_stop.call_count == 2
@@ -533,8 +479,6 @@ def test_main_recreates_broadcast_when_encoder_crashed(monkeypatch):
          patch.object(stream_scheduler.youtube_broadcast, "build_youtube_client", return_value=MagicMock()), \
          patch.object(stream_scheduler.youtube_broadcast, "find_stream_id", return_value="stream-1"), \
          patch.object(stream_scheduler.youtube_broadcast, "create_broadcast", return_value="bcast-1") as mock_create, \
-         patch.object(stream_scheduler.youtube_broadcast, "wait_for_stream_active", return_value=True), \
-         patch.object(stream_scheduler.youtube_broadcast, "transition_to_testing"), \
          patch.object(stream_scheduler.youtube_broadcast, "wait_for_live", return_value=True), \
          patch.object(stream_scheduler, "start_encoder", return_value=(rpicam_proc, ffmpeg_proc)) as mock_start, \
          patch.object(stream_scheduler, "stop_encoder") as mock_stop, \
@@ -602,8 +546,6 @@ def test_main_stops_encoder_when_leaving_active_window(monkeypatch):
          patch.object(stream_scheduler.youtube_broadcast, "build_youtube_client", return_value=MagicMock()), \
          patch.object(stream_scheduler.youtube_broadcast, "find_stream_id", return_value="stream-1"), \
          patch.object(stream_scheduler.youtube_broadcast, "create_broadcast", return_value="bcast-1") as mock_create, \
-         patch.object(stream_scheduler.youtube_broadcast, "wait_for_stream_active", return_value=True), \
-         patch.object(stream_scheduler.youtube_broadcast, "transition_to_testing"), \
          patch.object(stream_scheduler.youtube_broadcast, "wait_for_live", return_value=True), \
          patch.object(stream_scheduler, "start_encoder", return_value=(rpicam_proc, ffmpeg_proc)) as mock_start, \
          patch.object(stream_scheduler, "stop_encoder") as mock_stop, \
@@ -657,8 +599,6 @@ def test_main_stops_at_segment_boundary_without_immediate_restart(monkeypatch):
          patch.object(stream_scheduler.youtube_broadcast, "build_youtube_client", return_value=MagicMock()), \
          patch.object(stream_scheduler.youtube_broadcast, "find_stream_id", return_value="stream-1"), \
          patch.object(stream_scheduler.youtube_broadcast, "create_broadcast", return_value="bcast-1") as mock_create, \
-         patch.object(stream_scheduler.youtube_broadcast, "wait_for_stream_active", return_value=True), \
-         patch.object(stream_scheduler.youtube_broadcast, "transition_to_testing"), \
          patch.object(stream_scheduler.youtube_broadcast, "wait_for_live", return_value=True), \
          patch.object(stream_scheduler, "start_encoder", return_value=(rpicam_proc, ffmpeg_proc)) as mock_start, \
          patch.object(stream_scheduler, "stop_encoder") as mock_stop, \

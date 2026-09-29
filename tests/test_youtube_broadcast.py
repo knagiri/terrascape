@@ -49,19 +49,10 @@ def test_create_broadcast_inserts_and_binds():
     youtube.liveBroadcasts().bind.assert_called_with(
         id="bcast-1", part="id", streamId="stream-2"
     )
-    # stream が active になる前に transition(testing) を呼ぶと YouTube API が
-    # "Invalid transition" で拒否するため、create_broadcast では遷移させない。
+    # enableAutoStart=True の broadcast は stream が active になると YouTube 側が
+    # 自動で live へ遷移させるので、手動の transition は呼ばない（呼ぶとこの自動遷移と
+    # 衝突して invalidTransition エラーになる）。
     youtube.liveBroadcasts().transition.assert_not_called()
-
-
-def test_transition_to_testing_calls_transition_api():
-    youtube = _make_youtube_mock()
-
-    youtube_broadcast.transition_to_testing(youtube, "bcast-1")
-
-    youtube.liveBroadcasts().transition.assert_called_once_with(
-        broadcastStatus="testing", id="bcast-1", part="status"
-    )
 
 
 def test_get_lifecycle_status_returns_status_field():
@@ -78,7 +69,7 @@ def test_get_lifecycle_status_returns_status_field():
 def test_wait_for_live_returns_true_once_live():
     youtube = _make_youtube_mock()
     youtube.liveBroadcasts().list.return_value.execute.side_effect = [
-        {"items": [{"status": {"lifeCycleStatus": s}}]} for s in ["testing", "testing", "live"]
+        {"items": [{"status": {"lifeCycleStatus": s}}]} for s in ["ready", "liveStarting", "live"]
     ]
     sleep_calls = []
 
@@ -94,7 +85,7 @@ def test_wait_for_live_returns_true_once_live():
 def test_wait_for_live_returns_false_on_timeout(monkeypatch):
     youtube = _make_youtube_mock()
     youtube.liveBroadcasts().list.return_value.execute.return_value = {
-        "items": [{"status": {"lifeCycleStatus": "testing"}}]
+        "items": [{"status": {"lifeCycleStatus": "ready"}}]
     }
     call_count = {"n": 0}
 
@@ -114,61 +105,6 @@ def test_wait_for_live_returns_false_on_timeout(monkeypatch):
 
     result = youtube_broadcast.wait_for_live(
         youtube, "bcast-1", timeout_seconds=100, poll_interval_seconds=1,
-        sleep_fn=fake_sleep,
-    )
-
-    assert result is False
-
-
-def test_get_stream_status_returns_status_field():
-    youtube = _make_youtube_mock()
-    youtube.liveStreams().list.return_value.execute.return_value = {
-        "items": [{"status": {"streamStatus": "active"}}]
-    }
-
-    result = youtube_broadcast.get_stream_status(youtube, "stream-1")
-
-    assert result == "active"
-    youtube.liveStreams().list.assert_called_with(part="status", id="stream-1")
-
-
-def test_wait_for_stream_active_returns_true_once_active():
-    youtube = _make_youtube_mock()
-    youtube.liveStreams().list.return_value.execute.side_effect = [
-        {"items": [{"status": {"streamStatus": s}}]} for s in ["ready", "ready", "active"]
-    ]
-    sleep_calls = []
-
-    result = youtube_broadcast.wait_for_stream_active(
-        youtube, "stream-1", timeout_seconds=100, poll_interval_seconds=1,
-        sleep_fn=sleep_calls.append,
-    )
-
-    assert result is True
-    assert len(sleep_calls) == 2  # active になる前に2回ポーリング待機した
-
-
-def test_wait_for_stream_active_returns_false_on_timeout(monkeypatch):
-    youtube = _make_youtube_mock()
-    youtube.liveStreams().list.return_value.execute.return_value = {
-        "items": [{"status": {"streamStatus": "ready"}}]
-    }
-    call_count = {"n": 0}
-
-    def fake_sleep(_seconds):
-        call_count["n"] += 1
-        if call_count["n"] > 5:
-            raise AssertionError("timeout で止まらずポーリングし続けている")
-
-    times = iter([0, 1, 2, 3, 200])  # 4回目のチェックで timeout_seconds=100 を超える
-
-    def fake_monotonic():
-        return next(times, 999)
-
-    monkeypatch.setattr(youtube_broadcast.time, "monotonic", fake_monotonic)
-
-    result = youtube_broadcast.wait_for_stream_active(
-        youtube, "stream-1", timeout_seconds=100, poll_interval_seconds=1,
         sleep_fn=fake_sleep,
     )
 

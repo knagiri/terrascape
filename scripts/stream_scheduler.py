@@ -15,10 +15,10 @@ from astral.sun import sun
 import youtube_broadcast
 
 POLL_INTERVAL_SECONDS = 60
-WAIT_FOR_LIVE_TIMEOUT_SECONDS = 180
+# enableAutoStart による live 遷移は、ドキュメントの目安（5〜10秒）より大幅に遅い
+# （実機で encoder 起動から90秒経っても ready のままだった）ので、十分な余裕を持たせる。
+WAIT_FOR_LIVE_TIMEOUT_SECONDS = 600
 WAIT_FOR_LIVE_POLL_INTERVAL_SECONDS = 10
-WAIT_FOR_STREAM_ACTIVE_TIMEOUT_SECONDS = 60
-WAIT_FOR_STREAM_ACTIVE_POLL_INTERVAL_SECONDS = 5
 
 
 def load_config():
@@ -185,7 +185,7 @@ def main():
         """encoder を止め、rpicam_proc/ffmpeg_proc/current_segment_end を None に戻す。
 
         分岐が増えるたびに『stop_encoder → 3変数を None に戻す』を書き並べると
-        取りこぼしやすい（実際、transition_to_testing 等が start_encoder の後ろに
+        取りこぼしやすい（実際、YouTube API 呼び出しが start_encoder の後ろに
         移った際にこの後始末が抜け、encoder を起動したまま例外を外側の except に
         投げてしまう不具合があった）。ヘルパーに一本化してその種の抜けを防ぐ。
         """
@@ -217,42 +217,23 @@ def main():
                             config, _build_rtmp_url(config["youtube_stream_key"])
                         )
                         current_segment_end = active_segment[1]
+                        # wait_for_live が例外（API エラー等）を投げても、encoder を
+                        # 起動したまま次サイクルへ渡さない。ここで一度止めてから re-raise し、
+                        # 外側の except Exception でログして次のポーリングサイクルで
+                        # broadcast 作成からやり直す。
                         try:
-                            stream_active = youtube_broadcast.wait_for_stream_active(
+                            live = youtube_broadcast.wait_for_live(
                                 youtube,
-                                stream_id,
-                                WAIT_FOR_STREAM_ACTIVE_TIMEOUT_SECONDS,
-                                WAIT_FOR_STREAM_ACTIVE_POLL_INTERVAL_SECONDS,
+                                broadcast_id,
+                                WAIT_FOR_LIVE_TIMEOUT_SECONDS,
+                                WAIT_FOR_LIVE_POLL_INTERVAL_SECONDS,
                             )
                         except Exception:
-                            # wait_for_stream_active 自体が例外（API エラー等）を投げても、
-                            # encoder を起動したまま放置しない。下の except Exception で
-                            # ログしてリトライできるよう、ここで一度止めてから re-raise する。
                             stop_and_clear()
                             raise
-                        if not stream_active:
-                            # stream が active にならなかった。一度止めて次のポーリング
-                            # サイクルで再試行する。
+                        if not live:
+                            # live にならなかった。一度止めて次のポーリングサイクルで再試行する。
                             stop_and_clear()
-                        else:
-                            # transition_to_testing / wait_for_live も同様に、例外を
-                            # 投げたら encoder を張り付けたまま次サイクルへ渡さない。
-                            # ここで一度止めてから re-raise し、外側の except Exception で
-                            # ログして次のポーリングサイクルで broadcast 作成からやり直す。
-                            try:
-                                youtube_broadcast.transition_to_testing(youtube, broadcast_id)
-                                live = youtube_broadcast.wait_for_live(
-                                    youtube,
-                                    broadcast_id,
-                                    WAIT_FOR_LIVE_TIMEOUT_SECONDS,
-                                    WAIT_FOR_LIVE_POLL_INTERVAL_SECONDS,
-                                )
-                            except Exception:
-                                stop_and_clear()
-                                raise
-                            if not live:
-                                # live にならなかった。一度止めて次のポーリングサイクルで再試行する。
-                                stop_and_clear()
                     elif current_segment_end != active_segment[1]:
                         # セグメント境界をまたいだ（分割点に到達した）。一度止めて
                         # 次のポーリングサイクルで新しいセグメントとして再作成する。
@@ -267,7 +248,7 @@ def main():
                 except Exception as exc:
                     # YouTube API のネットワークエラー・トークン失効等はここで捕まえ、
                     # プロセス全体をクラッシュさせず次のポーリングサイクルでリトライする
-                    # （spec の要求どおり）。wait_for_stream_active 以降（encoder 起動後）の
+                    # （spec の要求どおり）。wait_for_live（encoder 起動後）の
                     # 例外は上の stop_and_clear() で既に後始末済みなので、rpicam_proc は
                     # 常に None に戻っている。create_broadcast / start_encoder 自体が
                     # 例外を投げた場合のみ、rpicam_proc が None のまま（またはまだ未起動）
