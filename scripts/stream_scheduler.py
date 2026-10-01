@@ -15,6 +15,8 @@ from astral.sun import sun
 import youtube_broadcast
 
 POLL_INTERVAL_SECONDS = 60
+MAX_CONSECUTIVE_FAILURES = 5
+BACKOFF_SECONDS = 1800  # 30分。連続失敗がMAX_CONSECUTIVE_FAILURES回に達したらこの間隔に切り替える
 # enableAutoStart による live 遷移は、ドキュメントの目安（5〜10秒）より大幅に遅い
 # （実機で encoder 起動から90秒経っても ready のままだった）ので、十分な余裕を持たせる。
 WAIT_FOR_LIVE_TIMEOUT_SECONDS = 600
@@ -180,6 +182,7 @@ def main():
     rpicam_proc = None
     ffmpeg_proc = None
     current_segment_end = None
+    consecutive_failures = 0
 
     def stop_and_clear():
         """encoder を止め、rpicam_proc/ffmpeg_proc/current_segment_end を None に戻す。
@@ -234,6 +237,8 @@ def main():
                         if not live:
                             # live にならなかった。一度止めて次のポーリングサイクルで再試行する。
                             stop_and_clear()
+                        else:
+                            consecutive_failures = 0
                     elif current_segment_end != active_segment[1]:
                         # セグメント境界をまたいだ（分割点に到達した）。一度止めて
                         # 次のポーリングサイクルで新しいセグメントとして再作成する。
@@ -253,12 +258,25 @@ def main():
                     # 常に None に戻っている。create_broadcast / start_encoder 自体が
                     # 例外を投げた場合のみ、rpicam_proc が None のまま（またはまだ未起動）
                     # なので次のループでそのまま broadcast 作成から再試行できる。
-                    print(f"stream_scheduler: error handling segment: {exc}", file=sys.stderr)
+                    consecutive_failures += 1
+                    print(
+                        f"stream_scheduler: error handling segment "
+                        f"(consecutive_failures={consecutive_failures}): {exc}",
+                        file=sys.stderr,
+                    )
             else:
                 if rpicam_proc is not None:
                     stop_and_clear()
 
-            time.sleep(POLL_INTERVAL_SECONDS)
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                print(
+                    f"stream_scheduler: {consecutive_failures}回連続で失敗したため "
+                    f"{BACKOFF_SECONDS}秒間隔にバックオフします",
+                    file=sys.stderr,
+                )
+                time.sleep(BACKOFF_SECONDS)
+            else:
+                time.sleep(POLL_INTERVAL_SECONDS)
     finally:
         if rpicam_proc is not None:
             stop_encoder(rpicam_proc, ffmpeg_proc)

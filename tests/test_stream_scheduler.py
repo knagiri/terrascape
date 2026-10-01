@@ -622,3 +622,140 @@ def test_main_stops_at_segment_boundary_without_immediate_restart(monkeypatch):
     assert mock_start.call_count == 2
     # 境界をまたいだときの停止 + SIGTERM 後の finally での後始末で計2回。
     assert mock_stop.call_count == 2
+
+
+def _recording_sleep_then_sigterm(n, recorded):
+    """time.sleep の差し替え用: 渡された秒数を recorded に記録し、n 回目の呼び出しで SIGTERM を配送する。"""
+
+    def _sleep(seconds):
+        recorded.append(seconds)
+        if len(recorded) >= n:
+            handler = signal.getsignal(signal.SIGTERM)
+            handler(signal.SIGTERM, None)
+
+    return _sleep
+
+
+def test_main_backs_off_after_max_consecutive_failures(monkeypatch):
+    """create_broadcast が失敗し続けたら、MAX_CONSECUTIVE_FAILURES 回目以降の待機は
+    POLL_INTERVAL_SECONDS ではなく BACKOFF_SECONDS になることを確認する。
+    レート制限・1日あたりの配信開始数上限に当たったとき、毎分 API を叩き続けて
+    状況を悪化させた実インシデントへのガード。
+    """
+    _set_required_env(monkeypatch)
+
+    now = _dt(23, 0)
+    sunset = _dt(19, 0)
+    sunrise = _dt(5, 0, day=2)
+
+    max_failures = stream_scheduler.MAX_CONSECUTIVE_FAILURES
+    total_sleeps = max_failures + 2
+    recorded = []
+
+    original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+    with patch.object(
+             stream_scheduler, "current_night_sun_times", return_value=(sunset, sunrise)
+         ), \
+         patch("stream_scheduler.datetime.datetime") as mock_datetime_cls, \
+         patch.object(stream_scheduler.youtube_broadcast, "build_youtube_client", return_value=MagicMock()), \
+         patch.object(stream_scheduler.youtube_broadcast, "find_stream_id", return_value="stream-1"), \
+         patch.object(
+             stream_scheduler.youtube_broadcast,
+             "create_broadcast",
+             side_effect=RuntimeError("quota exceeded"),
+         ) as mock_create, \
+         patch.object(stream_scheduler, "start_encoder") as mock_start, \
+         patch.object(stream_scheduler, "stop_encoder"), \
+         patch.object(
+             stream_scheduler.time, "sleep", _recording_sleep_then_sigterm(total_sleeps, recorded)
+         ):
+
+        mock_datetime_cls.now.return_value = now
+
+        try:
+            with pytest.raises(SystemExit):
+                stream_scheduler.main()
+        finally:
+            signal.signal(signal.SIGTERM, original_sigterm_handler)
+
+    assert mock_create.call_count == total_sleeps
+    mock_start.assert_not_called()
+    # k 回目の失敗直後の待機が recorded[k-1]。MAX_CONSECUTIVE_FAILURES 回目の失敗以降はバックオフ。
+    assert recorded == (
+        [stream_scheduler.POLL_INTERVAL_SECONDS] * (max_failures - 1)
+        + [stream_scheduler.BACKOFF_SECONDS] * (total_sleeps - max_failures + 1)
+    )
+    assert stream_scheduler.BACKOFF_SECONDS > stream_scheduler.POLL_INTERVAL_SECONDS
+
+
+def test_main_resets_failure_count_after_successful_live(monkeypatch):
+    """live に到達したら連続失敗数を 0 に戻し、その後の失敗はリセット前の蓄積分と
+    合算されないことを確認する。
+
+    シナリオ: MAX_CONSECUTIVE_FAILURES - 1 回失敗 → 成功して live → encoder クラッシュで
+    作り直し → 再び失敗が続く。リセットしない実装だと再失敗の1回目で累計が
+    MAX_CONSECUTIVE_FAILURES に達してバックオフしてしまう。再失敗が
+    MAX_CONSECUTIVE_FAILURES 回に達したところで初めてバックオフすることまで見て、
+    カウント自体は再開していることも確認する。
+    """
+    _set_required_env(monkeypatch)
+
+    now = _dt(23, 0)
+    sunset = _dt(19, 0)
+    sunrise = _dt(5, 0, day=2)
+
+    max_failures = stream_scheduler.MAX_CONSECUTIVE_FAILURES
+    poll = stream_scheduler.POLL_INTERVAL_SECONDS
+    backoff = stream_scheduler.BACKOFF_SECONDS
+
+    create_side_effect = (
+        [RuntimeError("quota exceeded")] * (max_failures - 1)
+        + ["bcast-1"]
+        + [RuntimeError("quota exceeded")] * max_failures
+    )
+    # 失敗 (max-1) 回 + 成功 1 回 + クラッシュ検知 1 回 + 再失敗 max 回 の各サイクル末尾で sleep する。
+    total_sleeps = (max_failures - 1) + 1 + 1 + max_failures
+    recorded = []
+
+    rpicam_proc = MagicMock()
+    ffmpeg_proc = MagicMock()
+
+    original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+    with patch.object(
+             stream_scheduler, "current_night_sun_times", return_value=(sunset, sunrise)
+         ), \
+         patch("stream_scheduler.datetime.datetime") as mock_datetime_cls, \
+         patch.object(stream_scheduler.youtube_broadcast, "build_youtube_client", return_value=MagicMock()), \
+         patch.object(stream_scheduler.youtube_broadcast, "find_stream_id", return_value="stream-1"), \
+         patch.object(
+             stream_scheduler.youtube_broadcast,
+             "create_broadcast",
+             side_effect=create_side_effect,
+         ) as mock_create, \
+         patch.object(stream_scheduler.youtube_broadcast, "wait_for_live", return_value=True), \
+         patch.object(stream_scheduler, "start_encoder", return_value=(rpicam_proc, ffmpeg_proc)) as mock_start, \
+         patch.object(stream_scheduler, "stop_encoder"), \
+         patch.object(stream_scheduler, "encoder_is_alive", side_effect=[False]), \
+         patch.object(
+             stream_scheduler.time, "sleep", _recording_sleep_then_sigterm(total_sleeps, recorded)
+         ):
+
+        mock_datetime_cls.now.return_value = now
+
+        try:
+            with pytest.raises(SystemExit):
+                stream_scheduler.main()
+        finally:
+            signal.signal(signal.SIGTERM, original_sigterm_handler)
+
+    assert mock_create.call_count == len(create_side_effect)
+    mock_start.assert_called_once()
+    assert recorded == (
+        [poll] * (max_failures - 1)  # 最初の失敗: 閾値未満
+        + [poll]  # live 成功（ここで 0 にリセット）
+        + [poll]  # encoder クラッシュ検知（失敗には数えない）
+        + [poll] * (max_failures - 1)  # 再失敗: リセット後なので閾値未満のまま
+        + [backoff]  # 再失敗が MAX_CONSECUTIVE_FAILURES 回に達してバックオフ
+    )
