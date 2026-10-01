@@ -15,8 +15,7 @@ from astral.sun import sun
 import youtube_broadcast
 
 POLL_INTERVAL_SECONDS = 60
-MAX_CONSECUTIVE_FAILURES = 5
-BACKOFF_SECONDS = 1800  # 30分。連続失敗がMAX_CONSECUTIVE_FAILURES回に達したらこの間隔に切り替える
+MAX_BACKOFF_SECONDS = 1800  # 30分。指数バックオフの上限
 # enableAutoStart による live 遷移は、ドキュメントの目安（5〜10秒）より大幅に遅い
 # （実機で encoder 起動から90秒経っても ready のままだった）ので、十分な余裕を持たせる。
 WAIT_FOR_LIVE_TIMEOUT_SECONDS = 600
@@ -268,15 +267,16 @@ def main():
                 if rpicam_proc is not None:
                     stop_and_clear()
 
-            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+            sleep_seconds = min(
+                POLL_INTERVAL_SECONDS * (2 ** consecutive_failures), MAX_BACKOFF_SECONDS
+            )
+            if sleep_seconds > POLL_INTERVAL_SECONDS:
                 print(
                     f"stream_scheduler: {consecutive_failures}回連続で失敗したため "
-                    f"{BACKOFF_SECONDS}秒間隔にバックオフします",
+                    f"{sleep_seconds}秒間隔にバックオフします",
                     file=sys.stderr,
                 )
-                time.sleep(BACKOFF_SECONDS)
-            else:
-                time.sleep(POLL_INTERVAL_SECONDS)
+            time.sleep(sleep_seconds)
     finally:
         if rpicam_proc is not None:
             stop_encoder(rpicam_proc, ffmpeg_proc)
