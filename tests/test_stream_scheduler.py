@@ -690,8 +690,8 @@ def test_main_resets_failure_count_after_successful_live(monkeypatch):
     （POLL_INTERVAL_SECONDS）に戻ることを確認する。
 
     シナリオ: 3 回失敗 → 成功して live → encoder クラッシュで作り直し → 再び失敗が続く。
-    リセットしない実装だと live 成功後も 960 秒以上待ち、再失敗も 4 回目以降の
-    間隔から始まってしまう。再失敗の間隔が 120 秒から倍々で伸び直すことまで見て、
+    リセットしない実装だと live 成功後も 480 秒待ち（encoder クラッシュ検知後も
+    同じ）、再失敗も 4 回目の間隔（960 秒）から始まってしまう。再失敗の間隔が 120 秒から倍々で伸び直すことまで見て、
     カウント自体は再開していることも確認する。
     """
     _set_required_env(monkeypatch)
