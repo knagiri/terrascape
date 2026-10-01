@@ -636,11 +636,12 @@ def _recording_sleep_then_sigterm(n, recorded):
     return _sleep
 
 
-def test_main_backs_off_after_max_consecutive_failures(monkeypatch):
-    """create_broadcast が失敗し続けたら、MAX_CONSECUTIVE_FAILURES 回目以降の待機は
-    POLL_INTERVAL_SECONDS ではなく BACKOFF_SECONDS になることを確認する。
+def test_main_backs_off_exponentially_after_consecutive_failures(monkeypatch):
+    """create_broadcast が失敗し続けたら、待機間隔が POLL_INTERVAL_SECONDS を起点に
+    倍々で伸び、MAX_BACKOFF_SECONDS で頭打ちになることを確認する。
     レート制限・1日あたりの配信開始数上限に当たったとき、毎分 API を叩き続けて
-    状況を悪化させた実インシデントへのガード。
+    状況を悪化させた実インシデントへのガード。固定2段階（一定回数で突然30分）の
+    崖ではなく、連続失敗数に応じて滑らかに伸びることまで見る。
     """
     _set_required_env(monkeypatch)
 
@@ -648,8 +649,8 @@ def test_main_backs_off_after_max_consecutive_failures(monkeypatch):
     sunset = _dt(19, 0)
     sunrise = _dt(5, 0, day=2)
 
-    max_failures = stream_scheduler.MAX_CONSECUTIVE_FAILURES
-    total_sleeps = max_failures + 2
+    # k 回目の失敗直後の待機は 60 * 2**k を 1800 で頭打ちにしたもの。
+    expected = [120, 240, 480, 960, 1800, 1800, 1800]
     recorded = []
 
     original_sigterm_handler = signal.getsignal(signal.SIGTERM)
@@ -668,7 +669,7 @@ def test_main_backs_off_after_max_consecutive_failures(monkeypatch):
          patch.object(stream_scheduler, "start_encoder") as mock_start, \
          patch.object(stream_scheduler, "stop_encoder"), \
          patch.object(
-             stream_scheduler.time, "sleep", _recording_sleep_then_sigterm(total_sleeps, recorded)
+             stream_scheduler.time, "sleep", _recording_sleep_then_sigterm(len(expected), recorded)
          ):
 
         mock_datetime_cls.now.return_value = now
@@ -679,24 +680,18 @@ def test_main_backs_off_after_max_consecutive_failures(monkeypatch):
         finally:
             signal.signal(signal.SIGTERM, original_sigterm_handler)
 
-    assert mock_create.call_count == total_sleeps
+    assert mock_create.call_count == len(expected)
     mock_start.assert_not_called()
-    # k 回目の失敗直後の待機が recorded[k-1]。MAX_CONSECUTIVE_FAILURES 回目の失敗以降はバックオフ。
-    assert recorded == (
-        [stream_scheduler.POLL_INTERVAL_SECONDS] * (max_failures - 1)
-        + [stream_scheduler.BACKOFF_SECONDS] * (total_sleeps - max_failures + 1)
-    )
-    assert stream_scheduler.BACKOFF_SECONDS > stream_scheduler.POLL_INTERVAL_SECONDS
+    assert recorded == expected
 
 
 def test_main_resets_failure_count_after_successful_live(monkeypatch):
-    """live に到達したら連続失敗数を 0 に戻し、その後の失敗はリセット前の蓄積分と
-    合算されないことを確認する。
+    """live に到達したら連続失敗数を 0 に戻し、その後の待機が指数バックオフの起点
+    （POLL_INTERVAL_SECONDS）に戻ることを確認する。
 
-    シナリオ: MAX_CONSECUTIVE_FAILURES - 1 回失敗 → 成功して live → encoder クラッシュで
-    作り直し → 再び失敗が続く。リセットしない実装だと再失敗の1回目で累計が
-    MAX_CONSECUTIVE_FAILURES に達してバックオフしてしまう。再失敗が
-    MAX_CONSECUTIVE_FAILURES 回に達したところで初めてバックオフすることまで見て、
+    シナリオ: 3 回失敗 → 成功して live → encoder クラッシュで作り直し → 再び失敗が続く。
+    リセットしない実装だと live 成功後も 960 秒以上待ち、再失敗も 4 回目以降の
+    間隔から始まってしまう。再失敗の間隔が 120 秒から倍々で伸び直すことまで見て、
     カウント自体は再開していることも確認する。
     """
     _set_required_env(monkeypatch)
@@ -705,17 +700,17 @@ def test_main_resets_failure_count_after_successful_live(monkeypatch):
     sunset = _dt(19, 0)
     sunrise = _dt(5, 0, day=2)
 
-    max_failures = stream_scheduler.MAX_CONSECUTIVE_FAILURES
-    poll = stream_scheduler.POLL_INTERVAL_SECONDS
-    backoff = stream_scheduler.BACKOFF_SECONDS
-
     create_side_effect = (
-        [RuntimeError("quota exceeded")] * (max_failures - 1)
+        [RuntimeError("quota exceeded")] * 3
         + ["bcast-1"]
-        + [RuntimeError("quota exceeded")] * max_failures
+        + [RuntimeError("quota exceeded")] * 3
     )
-    # 失敗 (max-1) 回 + 成功 1 回 + クラッシュ検知 1 回 + 再失敗 max 回 の各サイクル末尾で sleep する。
-    total_sleeps = (max_failures - 1) + 1 + 1 + max_failures
+    expected = (
+        [120, 240, 480]  # 最初の失敗: 倍々で伸びる
+        + [60]  # live 成功（ここで 0 にリセットされ起点に戻る）
+        + [60]  # encoder クラッシュ検知（失敗には数えない）
+        + [120, 240, 480]  # 再失敗: リセット後なので起点から伸び直す
+    )
     recorded = []
 
     rpicam_proc = MagicMock()
@@ -739,7 +734,7 @@ def test_main_resets_failure_count_after_successful_live(monkeypatch):
          patch.object(stream_scheduler, "stop_encoder"), \
          patch.object(stream_scheduler, "encoder_is_alive", side_effect=[False]), \
          patch.object(
-             stream_scheduler.time, "sleep", _recording_sleep_then_sigterm(total_sleeps, recorded)
+             stream_scheduler.time, "sleep", _recording_sleep_then_sigterm(len(expected), recorded)
          ):
 
         mock_datetime_cls.now.return_value = now
@@ -752,10 +747,4 @@ def test_main_resets_failure_count_after_successful_live(monkeypatch):
 
     assert mock_create.call_count == len(create_side_effect)
     mock_start.assert_called_once()
-    assert recorded == (
-        [poll] * (max_failures - 1)  # 最初の失敗: 閾値未満
-        + [poll]  # live 成功（ここで 0 にリセット）
-        + [poll]  # encoder クラッシュ検知（失敗には数えない）
-        + [poll] * (max_failures - 1)  # 再失敗: リセット後なので閾値未満のまま
-        + [backoff]  # 再失敗が MAX_CONSECUTIVE_FAILURES 回に達してバックオフ
-    )
+    assert recorded == expected
