@@ -266,6 +266,7 @@ def main():
             else:
                 if rpicam_proc is not None:
                     stop_and_clear()
+                consecutive_failures = 0
 
             sleep_seconds = min(
                 POLL_INTERVAL_SECONDS * (2 ** consecutive_failures), MAX_BACKOFF_SECONDS

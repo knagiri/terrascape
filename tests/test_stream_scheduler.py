@@ -748,3 +748,57 @@ def test_main_resets_failure_count_after_successful_live(monkeypatch):
     assert mock_create.call_count == len(create_side_effect)
     mock_start.assert_called_once()
     assert recorded == expected
+
+
+def test_main_resets_failure_count_when_leaving_active_segment(monkeypatch):
+    """夜間に失敗が続いたまま時間帯外（日中）に出たら連続失敗数を 0 に戻し、日中の
+    待機が POLL_INTERVAL_SECONDS になる（バックオフしない）ことを確認する。
+
+    実機で、夜間に一度も live にならず consecutive_failures が残ったまま日の出を
+    迎え、日中は何も試行していないのに「N回連続で失敗したためバックオフします」が
+    出続けたインシデントへのガード。リセットしない実装だと日中の待機が 480 秒のまま
+    になる。
+    """
+    _set_required_env(monkeypatch)
+
+    now_active = _dt(23, 0)  # 夜間（アクティブ）
+    now_outside = _dt(6, 0, day=2)  # 日の出後（時間帯外）
+    sunset = _dt(19, 0)
+    sunrise = _dt(5, 0, day=2)
+
+    expected = (
+        [120, 240, 480]  # 夜間の失敗: 倍々で伸びる
+        + [60, 60]  # 日中: 何も試行しないのでバックオフしない
+    )
+    recorded = []
+
+    original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+    with patch.object(
+             stream_scheduler, "current_night_sun_times", return_value=(sunset, sunrise)
+         ), \
+         patch("stream_scheduler.datetime.datetime") as mock_datetime_cls, \
+         patch.object(stream_scheduler.youtube_broadcast, "build_youtube_client", return_value=MagicMock()), \
+         patch.object(stream_scheduler.youtube_broadcast, "find_stream_id", return_value="stream-1"), \
+         patch.object(
+             stream_scheduler.youtube_broadcast,
+             "create_broadcast",
+             side_effect=RuntimeError("quota exceeded"),
+         ) as mock_create, \
+         patch.object(stream_scheduler, "start_encoder") as mock_start, \
+         patch.object(stream_scheduler, "stop_encoder"), \
+         patch.object(
+             stream_scheduler.time, "sleep", _recording_sleep_then_sigterm(len(expected), recorded)
+         ):
+
+        mock_datetime_cls.now.side_effect = [now_active] * 3 + [now_outside] * 2
+
+        try:
+            with pytest.raises(SystemExit):
+                stream_scheduler.main()
+        finally:
+            signal.signal(signal.SIGTERM, original_sigterm_handler)
+
+    assert mock_create.call_count == 3
+    mock_start.assert_not_called()
+    assert recorded == expected
