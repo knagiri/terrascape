@@ -50,7 +50,8 @@ def _raise_system_exit(signum, frame):
 def main():
     config = load_config()
     tz = zoneinfo.ZoneInfo(config["timezone"])
-    led = PWMLED(config["gpio_pin"])
+    # 既定の 100Hz では PWM 波形の位相がカメラのフレーム (30fps) と噛み合わず映像にちらつきが出るため、1000Hz に上げる。
+    led = PWMLED(config["gpio_pin"], frequency=1000)
     signal.signal(signal.SIGTERM, _raise_system_exit)
 
     try:
