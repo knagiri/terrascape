@@ -87,8 +87,10 @@ def test_main_turns_led_off_and_closes_on_sigterm(monkeypatch):
     state = {}
     original_pwmled = ir_light_daemon.PWMLED
 
-    def _tracking_pwmled(pin):
-        led = original_pwmled(pin)
+    def _tracking_pwmled(pin, frequency=100):
+        # gpiozero の PWMLED と同じ既定値 (100Hz) を持たせ、main() が渡した値を記録する。
+        state["frequency"] = frequency
+        led = original_pwmled(pin, frequency=frequency)
         state["led"] = led
         original_close = led.close
 
@@ -122,3 +124,5 @@ def test_main_turns_led_off_and_closes_on_sigterm(monkeypatch):
     # （compute_brightness を 0.3 固定にしたので、off() が無ければここは 0.3 のまま）。
     assert state["value_before_close"] == 0.0
     assert led.closed
+    # 既定の 100Hz ではカメラ映像にちらつきが出るため、1000Hz で生成していること。
+    assert state["frequency"] == 1000
