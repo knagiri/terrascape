@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """YouTube Data API の OAuth 認可を一度だけ手動で行い、refresh token を発行するツール。
 
-ブラウザが開けるマシン（Pi である必要はない）で実行する。表示された refresh token を
-対象機の .env の YOUTUBE_REFRESH_TOKEN に貼り付ける。
+同意画面が「テスト中」の OAuth アプリでは refresh token が 7 日で失効するため、初回だけでなく
+失効のたびに再実行する（手順は README を参照）。表示された refresh token を対象機の .env の
+YOUTUBE_REFRESH_TOKEN に貼り付ける。
+
+ブラウザは自動起動せず、認可 URL を標準出力に表示する。それを手元のブラウザで開いて認可する。
+認可後のリダイレクト先はスクリプトが待ち受ける localhost:8765 なので、SSH 先など別マシンで
+実行する場合は、先に手元から ssh -L 8765:localhost:8765 <user>@<host> でトンネルを張っておく。
 
 client id / client secret は環境変数 YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET から読み、
 未設定なら対話入力させる。コマンドライン引数で受け取らないのは、shell history や
@@ -16,6 +21,9 @@ import sys
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 SCOPES = ["https://www.googleapis.com/auth/youtube"]
+# SSH 先などブラウザを開けない環境でも使えるよう、ポートを固定して
+# ssh -L でトンネルできるようにする（port=0 のランダムポートだと事前にトンネルを張れない）。
+LOCAL_SERVER_PORT = 8765
 
 
 def main():
@@ -50,7 +58,12 @@ def main():
     # Google は既に付与済みとみなして refresh_token を返さないことがある
     # （access_type=offline は既定で付くが prompt はそれだけでは consent にならない）。
     # 常に consent 画面を強制することで refresh_token の取りこぼしを防ぐ。
-    credentials = flow.run_local_server(port=0, prompt="consent")
+    # open_browser=False: ブラウザの自動起動を試みると、headless 環境では
+    # webbrowser.Error（could not locate runnable browser）でクラッシュする。
+    # 代わりに認可 URL を標準出力に表示させ、手元のブラウザで開いてもらう。
+    credentials = flow.run_local_server(
+        port=LOCAL_SERVER_PORT, prompt="consent", open_browser=False
+    )
 
     if not credentials.refresh_token:
         print(
