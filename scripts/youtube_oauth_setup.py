@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""YouTube Data API の OAuth 認可を一度だけ手動で行い、refresh token を発行するツール。
+"""YouTube Data API の OAuth 認可を手動で行い、refresh token を発行するツール。
 
 同意画面が「テスト中」の OAuth アプリでは refresh token が 7 日で失効するため、初回だけでなく
 失効のたびに再実行する（手順は README を参照）。表示された refresh token を対象機の .env の
