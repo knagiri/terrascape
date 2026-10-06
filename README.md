@@ -45,7 +45,7 @@ sudo systemctl enable --now terrascape-stream-scheduler
 
 - `YOUTUBE_STREAM_KEY`: YouTube Studio で取得したストリームキー
 - `YOUTUBE_CLIENT_ID` / `YOUTUBE_CLIENT_SECRET` / `YOUTUBE_REFRESH_TOKEN`: 下記「YouTube Data API の
-  OAuth 初回セットアップ」で一度だけ発行する
+  OAuth セットアップ」で発行する（refresh token は7日ごとに再発行が必要）
 - `IR_LIGHT_LATITUDE` / `IR_LIGHT_LONGITUDE` / `IR_LIGHT_TIMEZONE`: 日没・日の出の計算に IR ライトと
   同じ設置場所の値を使う
 - `MAX_SEGMENT_HOURS`: 1本の配信の最大時間（時間単位）。既定値は無く必須。`.env.example` の
@@ -87,11 +87,19 @@ sudo ln -s ~/terrascape/systemd/terrascape-stream-scheduler.service /etc/systemd
 sudo systemctl daemon-reload
 ```
 
-### YouTube Data API の OAuth 初回セットアップ
+### YouTube Data API の OAuth セットアップ（初回・7日ごとの再発行）
 
-配信スケジューラが YouTube Data API で broadcast を作成するための refresh token を一度だけ発行する。
-Google Cloud Console で YouTube Data API v3 を有効化し、OAuth クライアント（種類: デスクトップアプリ）を
-作成してから、ブラウザを開けるマシン（Pi である必要はない）で実行する。
+配信スケジューラが YouTube Data API で broadcast を作成するための refresh token を発行する。
+初回は Google Cloud Console で YouTube Data API v3 を有効化し、OAuth クライアント（種類: デスクトップアプリ）を
+作成しておく。
+
+この OAuth アプリは同意画面の公開ステータスを「テスト中（Testing）」のままにしているため、Google が
+発行する refresh token は **7日で失効する**。失効すると配信スケジューラの journal に
+`invalid_grant: Token has been expired or revoked.` が出て配信が止まる。その時はこの手順で
+refresh token を再発行して `.env` の `YOUTUBE_REFRESH_TOKEN` を差し替え、スケジューラを再起動する。
+
+公開ステータスを「本番（In production）」にすればこの7日失効は無くなる見込みだが、branding
+（アプリのホームページ・プライバシーポリシー等）の整備が必要なため、現時点では採っていない。
 
 ```bash
 python3 -m venv /tmp/oauth-venv && /tmp/oauth-venv/bin/pip install google-auth-oauthlib
@@ -100,9 +108,24 @@ python3 -m venv /tmp/oauth-venv && /tmp/oauth-venv/bin/pip install google-auth-o
 
 client id / client secret は起動後に対話入力する（環境変数 `YOUTUBE_CLIENT_ID` /
 `YOUTUBE_CLIENT_SECRET` があればそれを使う）。client secret が shell history や `ps` に残らないよう、
-コマンドライン引数では渡さない。ブラウザでの認可後に表示される refresh token を、client id /
-client secret と合わせて `.env` の `YOUTUBE_CLIENT_ID` / `YOUTUBE_CLIENT_SECRET` /
-`YOUTUBE_REFRESH_TOKEN` に設定する。
+コマンドライン引数では渡さない。
+
+スクリプトはブラウザを自動起動せず、認可 URL を表示して `localhost:8765` で認可後のリダイレクトを
+待ち受ける。表示された URL をブラウザで開いて認可する。ブラウザを開けない環境（SSH 先の Pi 等）で
+実行する場合は、手元のマシンから先に別ターミナルでトンネルを張ってから実行し、表示された認可 URL を
+手元のブラウザで開く:
+
+```bash
+ssh -L 8765:localhost:8765 <user>@<host>
+```
+
+認可後に表示される refresh token を `.env` の `YOUTUBE_REFRESH_TOKEN` に設定する（初回は client id /
+client secret も `YOUTUBE_CLIENT_ID` / `YOUTUBE_CLIENT_SECRET` に設定する）。再発行時は差し替え後に
+スケジューラを再起動する:
+
+```bash
+sudo systemctl restart terrascape-stream-scheduler
+```
 
 ## IR ライト自動点灯
 
