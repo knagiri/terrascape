@@ -15,6 +15,20 @@ def _dt(hour, minute=0, day=1):
     return datetime.datetime(2026, 12, day, hour, minute, tzinfo=JST)
 
 
+@pytest.fixture(autouse=True)
+def _no_pending_broadcasts():
+    """main() は broadcast 作成前に残骸の pending broadcast を列挙・削除する。
+
+    youtube クライアントは MagicMock なので、patch しないと list_next が常に
+    非 None を返し list_pending_broadcast_ids が無限ループする。既定では残骸なしとし、
+    削除呼び出しを検証したいテストは with 内で改めて patch して上書きする。
+    """
+    with patch.object(
+        stream_scheduler.youtube_broadcast, "list_pending_broadcast_ids", return_value=[]
+    ), patch.object(stream_scheduler.youtube_broadcast, "delete_broadcast"):
+        yield
+
+
 def test_compute_segments_short_night_no_split():
     # 9時間の夜、上限10時間 -> 分割なし
     sunset = _dt(19, 0)
@@ -802,3 +816,130 @@ def test_main_resets_failure_count_when_leaving_active_segment(monkeypatch):
     assert mock_create.call_count == 3
     mock_start.assert_not_called()
     assert recorded == expected
+
+
+def _run_main_in_active_segment(wait_for_live_side_effect, sleep_fn, extra_patches=()):
+    """常に夜間（アクティブなセグメント内）で main() を回し、SIGTERM で抜けるまで実行する。
+
+    create_broadcast は呼ばれるたびに bcast-1, bcast-2, ... を返す。
+    """
+    now = _dt(23, 0)
+    sunset = _dt(19, 0)
+    sunrise = _dt(5, 0, day=2)
+    broadcast_ids = (f"bcast-{i}" for i in range(1, 100))
+
+    original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+    with patch.object(
+             stream_scheduler, "current_night_sun_times", return_value=(sunset, sunrise)
+         ), \
+         patch("stream_scheduler.datetime.datetime") as mock_datetime_cls, \
+         patch.object(stream_scheduler.youtube_broadcast, "build_youtube_client", return_value=MagicMock()), \
+         patch.object(stream_scheduler.youtube_broadcast, "find_stream_id", return_value="stream-1"), \
+         patch.object(
+             stream_scheduler.youtube_broadcast,
+             "create_broadcast",
+             side_effect=lambda *a, **k: next(broadcast_ids),
+         ), \
+         patch.object(
+             stream_scheduler.youtube_broadcast,
+             "wait_for_live",
+             side_effect=wait_for_live_side_effect,
+         ), \
+         patch.object(stream_scheduler, "start_encoder", return_value=(MagicMock(), MagicMock())), \
+         patch.object(stream_scheduler, "stop_encoder"), \
+         patch.object(stream_scheduler, "encoder_is_alive", return_value=True), \
+         patch.object(stream_scheduler.time, "sleep", sleep_fn):
+        mock_datetime_cls.now.return_value = now
+        try:
+            with pytest.raises(SystemExit):
+                stream_scheduler.main()
+        finally:
+            signal.signal(signal.SIGTERM, original_sigterm_handler)
+
+
+def test_main_deletes_broadcast_when_wait_for_live_times_out(monkeypatch):
+    """wait_for_live が timeout (False) を返したら、作った broadcast を削除してから諦める。
+
+    同じ persistent stream に bind された broadcast はキューとして積まれる。放棄した
+    broadcast を残すと、次に作った broadcast はキューの前の分が消費されるまで live に
+    ならず、また timeout して新しい broadcast を作る自己増殖ループに陥る（実機で観測:
+    どの broadcast もきっかり 600 秒で終了し、作成からライブ開始まで約33分ずれていた）。
+    """
+    _set_required_env(monkeypatch)
+
+    with patch.object(stream_scheduler.youtube_broadcast, "delete_broadcast") as mock_delete:
+        _run_main_in_active_segment([False, True], _sleep_n_times_then_sigterm(2))
+
+    # 1回目の bcast-1 だけが timeout で放棄されるので削除される。2回目の bcast-2 は
+    # live になっているので削除しない。
+    mock_delete.assert_called_once()
+    assert mock_delete.call_args.args[1] == "bcast-1"
+
+
+def test_main_deletes_broadcast_and_propagates_when_wait_for_live_raises(monkeypatch, capsys):
+    """wait_for_live が例外を投げたときも作った broadcast を削除し、元の例外は外側の
+    except まで伝播して（ログに残って）次のサイクルで再試行される。"""
+    _set_required_env(monkeypatch)
+
+    with patch.object(stream_scheduler.youtube_broadcast, "delete_broadcast") as mock_delete:
+        _run_main_in_active_segment(
+            [RuntimeError("wait_for_live network error"), True],
+            _sleep_n_times_then_sigterm(2),
+        )
+
+    mock_delete.assert_called_once()
+    assert mock_delete.call_args.args[1] == "bcast-1"
+    assert "wait_for_live network error" in capsys.readouterr().err
+
+
+def test_main_keeps_original_error_when_delete_after_wait_for_live_error_fails(
+    monkeypatch, capsys
+):
+    """wait_for_live の例外後の削除自体が失敗しても、元の例外を潰さない。
+    削除の失敗はログに残し、外側へは元の例外が伝播する。"""
+    _set_required_env(monkeypatch)
+
+    with patch.object(
+        stream_scheduler.youtube_broadcast,
+        "delete_broadcast",
+        side_effect=RuntimeError("delete failed"),
+    ) as mock_delete:
+        _run_main_in_active_segment(
+            [RuntimeError("wait_for_live network error")],
+            _sleep_n_times_then_sigterm(1),
+        )
+
+    mock_delete.assert_called_once()
+    err = capsys.readouterr().err
+    assert "delete failed" in err
+    # 外側の except がログするのは元の例外（削除の例外に置き換わっていない）。
+    assert "error handling segment" in err
+    error_line = next(l for l in err.splitlines() if "error handling segment" in l)
+    assert "wait_for_live network error" in error_line
+
+
+def test_main_deletes_stale_pending_broadcasts_before_creating(monkeypatch):
+    """broadcast 作成前に、前回の異常終了等で取り残された pending broadcast を削除する。
+    残骸がキューに残ると、新しく作る broadcast が live になるまで古い分の消費を待つことになる。
+    """
+    _set_required_env(monkeypatch)
+
+    with patch.object(
+             stream_scheduler.youtube_broadcast,
+             "list_pending_broadcast_ids",
+             return_value=["stale-1", "stale-2"],
+         ) as mock_list, \
+         patch.object(stream_scheduler.youtube_broadcast, "delete_broadcast") as mock_delete:
+        deleted_before_wait = []
+
+        def _wait(*args, **kwargs):
+            # wait_for_live は create_broadcast の後に呼ばれる。この時点までに残骸の削除が
+            # 済んでいることで「作成前に掃除した」ことを確認する。
+            deleted_before_wait.extend(c.args[1] for c in mock_delete.call_args_list)
+            return True
+
+        _run_main_in_active_segment(_wait, _sleep_n_times_then_sigterm(1))
+
+    mock_list.assert_called_once()
+    assert deleted_before_wait == ["stale-1", "stale-2"]
+    assert [c.args[1] for c in mock_delete.call_args_list] == ["stale-1", "stale-2"]

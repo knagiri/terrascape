@@ -109,3 +109,31 @@ def test_wait_for_live_returns_false_on_timeout(monkeypatch):
     )
 
     assert result is False
+
+
+def test_delete_broadcast_deletes_by_id():
+    youtube = _make_youtube_mock()
+
+    youtube_broadcast.delete_broadcast(youtube, "bcast-1")
+
+    youtube.liveBroadcasts().delete.assert_called_once_with(id="bcast-1")
+    youtube.liveBroadcasts().delete.return_value.execute.assert_called_once()
+
+
+def test_list_pending_broadcast_ids_follows_pages_with_upcoming_filter():
+    youtube = _make_youtube_mock()
+    first_request = MagicMock()
+    second_request = MagicMock()
+    first_request.execute.return_value = {"items": [{"id": "old-1"}, {"id": "old-2"}]}
+    second_request.execute.return_value = {"items": [{"id": "old-3"}]}
+    youtube.liveBroadcasts().list.return_value = first_request
+    youtube.liveBroadcasts().list_next.side_effect = [second_request, None]
+
+    result = youtube_broadcast.list_pending_broadcast_ids(youtube)
+
+    assert result == ["old-1", "old-2", "old-3"]
+    # broadcastStatus と mine は同時指定できない（実機で incompatibleParameters になる）ので
+    # mine は渡さない。
+    youtube.liveBroadcasts().list.assert_called_once_with(
+        part="id", broadcastStatus="upcoming"
+    )

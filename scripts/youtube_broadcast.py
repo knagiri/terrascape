@@ -99,3 +99,30 @@ def wait_for_live(
         if time.monotonic() >= deadline:
             return False
         sleep_fn(poll_interval_seconds)
+
+
+def delete_broadcast(youtube, broadcast_id):
+    """broadcast を削除する。
+
+    放棄する broadcast を残すと、同じ persistent stream に bind された
+    broadcast がキューとして積まれ、次に作った broadcast が live になるまで
+    キューの前の分が消費されるのを待つことになる（実機で約33分の遅延と、
+    リトライごとにキューが伸びる自己増殖ループを観測した）。放棄する時点で
+    必ず削除してキューを残さない。
+    """
+    youtube.liveBroadcasts().delete(id=broadcast_id).execute()
+
+
+def list_pending_broadcast_ids(youtube):
+    """まだライブ化していない（upcoming/ready 等の）broadcast の id を列挙する。
+
+    broadcastStatus と mine は同時指定できない（実機で incompatibleParameters
+    エラーになる）ので mine は付けない。
+    """
+    ids = []
+    request = youtube.liveBroadcasts().list(part="id", broadcastStatus="upcoming")
+    while request is not None:
+        response = request.execute()
+        ids.extend(item["id"] for item in response.get("items", []))
+        request = youtube.liveBroadcasts().list_next(request, response)
+    return ids
