@@ -109,3 +109,61 @@ def test_wait_for_live_returns_false_on_timeout(monkeypatch):
     )
 
     assert result is False
+
+
+def test_delete_broadcast_deletes_by_id():
+    youtube = _make_youtube_mock()
+
+    youtube_broadcast.delete_broadcast(youtube, "bcast-1")
+
+    youtube.liveBroadcasts().delete.assert_called_once_with(id="bcast-1")
+    youtube.liveBroadcasts().delete.return_value.execute.assert_called_once()
+
+
+def _pending_item(broadcast_id, bound_stream_id="stream-1", title="Terrascape Live 2026-10-06 23:00"):
+    item = {"id": broadcast_id, "snippet": {"title": title}, "contentDetails": {}}
+    if bound_stream_id is not None:
+        item["contentDetails"]["boundStreamId"] = bound_stream_id
+    return item
+
+
+def test_list_pending_broadcast_ids_follows_pages_with_upcoming_filter():
+    youtube = _make_youtube_mock()
+    first_request = MagicMock()
+    second_request = MagicMock()
+    first_request.execute.return_value = {"items": [_pending_item("old-1"), _pending_item("old-2")]}
+    second_request.execute.return_value = {"items": [_pending_item("old-3")]}
+    youtube.liveBroadcasts().list.return_value = first_request
+    youtube.liveBroadcasts().list_next.side_effect = [second_request, None]
+
+    result = youtube_broadcast.list_pending_broadcast_ids(youtube, "stream-1")
+
+    assert result == ["old-1", "old-2", "old-3"]
+    # broadcastStatus と mine は同時指定できない（実機で incompatibleParameters になる）ので
+    # mine は渡さない。絞り込みに snippet.title と contentDetails.boundStreamId を使う。
+    youtube.liveBroadcasts().list.assert_called_once_with(
+        part="id,snippet,contentDetails", broadcastStatus="upcoming"
+    )
+
+
+def test_list_pending_broadcast_ids_excludes_other_streams_and_manual_broadcasts():
+    """削除は取り消せないので、この stream に bind された、デーモン自身が作った
+    broadcast だけを返す。別 stream・未 bind・接頭辞の違う（手動予約の）ものは除外する。"""
+    youtube = _make_youtube_mock()
+    youtube.liveBroadcasts().list.return_value.execute.return_value = {
+        "items": [
+            _pending_item("ours"),
+            _pending_item("other-stream", bound_stream_id="stream-2"),
+            _pending_item("unbound", bound_stream_id=None),
+            _pending_item("manual", title="週末の予約配信"),
+        ]
+    }
+    youtube.liveBroadcasts().list_next.return_value = None
+
+    result = youtube_broadcast.list_pending_broadcast_ids(youtube, "stream-1")
+
+    assert result == ["ours"]
+
+
+def test_broadcast_title_prefix_matches_daemon_titles():
+    assert youtube_broadcast.BROADCAST_TITLE_PREFIX == "Terrascape Live "

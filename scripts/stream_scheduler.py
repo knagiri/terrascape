@@ -211,7 +211,14 @@ def main():
             if active_segment is not None:
                 try:
                     if rpicam_proc is None:
-                        title = f"Terrascape Live {now:%Y-%m-%d %H:%M}"
+                        # 前サイクルの残骸がキューとして積まれると、新しく作る broadcast が
+                        # live になるまで古い分の消費を待つことになる。作る前に掃除する。
+                        for stale_id in youtube_broadcast.list_pending_broadcast_ids(
+                            youtube, stream_id
+                        ):
+                            youtube_broadcast.delete_broadcast(youtube, stale_id)
+
+                        title = f"{youtube_broadcast.BROADCAST_TITLE_PREFIX}{now:%Y-%m-%d %H:%M}"
                         broadcast_id = youtube_broadcast.create_broadcast(
                             youtube, stream_id, title, privacy_status="unlisted"
                         )
@@ -220,9 +227,9 @@ def main():
                         )
                         current_segment_end = active_segment[1]
                         # wait_for_live が例外（API エラー等）を投げても、encoder を
-                        # 起動したまま次サイクルへ渡さない。ここで一度止めてから re-raise し、
-                        # 外側の except Exception でログして次のポーリングサイクルで
-                        # broadcast 作成からやり直す。
+                        # 起動したまま次サイクルへ渡さない。ここで一度止め、放棄する
+                        # broadcast も削除してから re-raise し、外側の except Exception で
+                        # ログして次のポーリングサイクルで broadcast 作成からやり直す。
                         try:
                             live = youtube_broadcast.wait_for_live(
                                 youtube,
@@ -232,10 +239,21 @@ def main():
                             )
                         except Exception:
                             stop_and_clear()
+                            # 削除の失敗で元の例外を潰さない（ログだけ残して元の例外を投げ直す）。
+                            try:
+                                youtube_broadcast.delete_broadcast(youtube, broadcast_id)
+                            except Exception as delete_exc:
+                                print(
+                                    f"stream_scheduler: failed to delete abandoned broadcast "
+                                    f"{broadcast_id}: {delete_exc}",
+                                    file=sys.stderr,
+                                )
                             raise
                         if not live:
-                            # live にならなかった。一度止めて次のポーリングサイクルで再試行する。
+                            # live にならなかった。放棄する broadcast を残すとキューに
+                            # 積まれて次の試行を阻害するので、削除してから諦める。
                             stop_and_clear()
+                            youtube_broadcast.delete_broadcast(youtube, broadcast_id)
                         else:
                             consecutive_failures = 0
                     elif current_segment_end != active_segment[1]:
