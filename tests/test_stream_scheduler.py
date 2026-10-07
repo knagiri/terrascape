@@ -818,10 +818,10 @@ def test_main_resets_failure_count_when_leaving_active_segment(monkeypatch):
     assert recorded == expected
 
 
-def _run_main_in_active_segment(wait_for_live_side_effect, sleep_fn, extra_patches=()):
+def _run_main_in_active_segment(wait_for_live_side_effect, sleep_fn):
     """常に夜間（アクティブなセグメント内）で main() を回し、SIGTERM で抜けるまで実行する。
 
-    create_broadcast は呼ばれるたびに bcast-1, bcast-2, ... を返す。
+    create_broadcast は呼ばれるたびに bcast-1, bcast-2, ... を返す。その mock を返す。
     """
     now = _dt(23, 0)
     sunset = _dt(19, 0)
@@ -839,7 +839,7 @@ def _run_main_in_active_segment(wait_for_live_side_effect, sleep_fn, extra_patch
              stream_scheduler.youtube_broadcast,
              "create_broadcast",
              side_effect=lambda *a, **k: next(broadcast_ids),
-         ), \
+         ) as mock_create, \
          patch.object(
              stream_scheduler.youtube_broadcast,
              "wait_for_live",
@@ -855,6 +855,7 @@ def _run_main_in_active_segment(wait_for_live_side_effect, sleep_fn, extra_patch
                 stream_scheduler.main()
         finally:
             signal.signal(signal.SIGTERM, original_sigterm_handler)
+    return mock_create
 
 
 def test_main_deletes_broadcast_when_wait_for_live_times_out(monkeypatch):
@@ -943,3 +944,20 @@ def test_main_deletes_stale_pending_broadcasts_before_creating(monkeypatch):
     mock_list.assert_called_once()
     assert deleted_before_wait == ["stale-1", "stale-2"]
     assert [c.args[1] for c in mock_delete.call_args_list] == ["stale-1", "stale-2"]
+
+
+def test_main_lists_pending_broadcasts_of_own_stream_with_shared_title_prefix(monkeypatch):
+    """残骸の列挙には自分の stream_id を渡し、作る broadcast のタイトルは掃除側と同じ
+    接頭辞（BROADCAST_TITLE_PREFIX）を使う。片方だけ変わると残骸の掃除が効かなくなる。"""
+    _set_required_env(monkeypatch)
+
+    with patch.object(
+             stream_scheduler.youtube_broadcast, "list_pending_broadcast_ids", return_value=[]
+         ) as mock_list, \
+         patch.object(
+             stream_scheduler.youtube_broadcast, "BROADCAST_TITLE_PREFIX", "PREFIX-CHECK "
+         ):
+        mock_create = _run_main_in_active_segment([True], _sleep_n_times_then_sigterm(1))
+
+    assert mock_list.call_args.args[1] == "stream-1"
+    assert mock_create.call_args.args[2].startswith("PREFIX-CHECK ")

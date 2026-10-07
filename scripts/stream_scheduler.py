@@ -213,10 +213,12 @@ def main():
                     if rpicam_proc is None:
                         # 前サイクルの残骸がキューとして積まれると、新しく作る broadcast が
                         # live になるまで古い分の消費を待つことになる。作る前に掃除する。
-                        for stale_id in youtube_broadcast.list_pending_broadcast_ids(youtube):
+                        for stale_id in youtube_broadcast.list_pending_broadcast_ids(
+                            youtube, stream_id
+                        ):
                             youtube_broadcast.delete_broadcast(youtube, stale_id)
 
-                        title = f"Terrascape Live {now:%Y-%m-%d %H:%M}"
+                        title = f"{youtube_broadcast.BROADCAST_TITLE_PREFIX}{now:%Y-%m-%d %H:%M}"
                         broadcast_id = youtube_broadcast.create_broadcast(
                             youtube, stream_id, title, privacy_status="unlisted"
                         )

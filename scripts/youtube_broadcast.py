@@ -12,6 +12,10 @@ from googleapiclient.discovery import build
 
 SCOPES = ["https://www.googleapis.com/auth/youtube"]
 TOKEN_URI = "https://oauth2.googleapis.com/token"
+# デーモンが作る broadcast のタイトル接頭辞。list_pending_broadcast_ids はこの接頭辞で
+# 「デーモン自身が作ったもの」を見分けるので、タイトル生成側も必ずこの定数を使う
+# （片方だけ変えると残骸の掃除が効かなくなる）。
+BROADCAST_TITLE_PREFIX = "Terrascape Live "
 
 
 def build_youtube_client(client_id, client_secret, refresh_token):
@@ -113,16 +117,28 @@ def delete_broadcast(youtube, broadcast_id):
     youtube.liveBroadcasts().delete(id=broadcast_id).execute()
 
 
-def list_pending_broadcast_ids(youtube):
-    """まだライブ化していない（upcoming/ready 等の）broadcast の id を列挙する。
+def list_pending_broadcast_ids(youtube, stream_id):
+    """stream_id に bind された、デーモン自身が作った未ライブ化の broadcast の id を列挙する。
+
+    削除は取り消せないので、対象を次の AND に絞る:
+    - contentDetails.boundStreamId == stream_id（キューになるのは同じ stream に
+      bind されたものだけ）
+    - snippet.title が BROADCAST_TITLE_PREFIX で始まる（同じ stream key に bind された
+      手動予約の配信を巻き込まない）
 
     broadcastStatus と mine は同時指定できない（実機で incompatibleParameters
     エラーになる）ので mine は付けない。
     """
     ids = []
-    request = youtube.liveBroadcasts().list(part="id", broadcastStatus="upcoming")
+    request = youtube.liveBroadcasts().list(
+        part="id,snippet,contentDetails", broadcastStatus="upcoming"
+    )
     while request is not None:
         response = request.execute()
-        ids.extend(item["id"] for item in response.get("items", []))
+        for item in response.get("items", []):
+            bound_stream_id = item.get("contentDetails", {}).get("boundStreamId")
+            title = item.get("snippet", {}).get("title", "")
+            if bound_stream_id == stream_id and title.startswith(BROADCAST_TITLE_PREFIX):
+                ids.append(item["id"])
         request = youtube.liveBroadcasts().list_next(request, response)
     return ids
