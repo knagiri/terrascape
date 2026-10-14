@@ -98,6 +98,9 @@ def build_rpicam_command(config):
         "--height", str(config["stream_height"]),
         "--framerate", str(config["stream_fps"]),
         "--intra", str(config["stream_fps"] * 2),
+        # 既定だと毎フレーム '#N (30.01 fps) exp ...' を stderr に出し、journal で
+        # 肝心の行が埋もれる。
+        "--verbose", "0",
         "-o", "-",
     ]
 
@@ -226,6 +229,11 @@ def main():
                             config, _build_rtmp_url(config["youtube_stream_key"])
                         )
                         current_segment_end = active_segment[1]
+                        print(
+                            f"stream_scheduler: started encoder for broadcast {broadcast_id}",
+                            file=sys.stderr,
+                        )
+                        wait_started = time.monotonic()
                         # wait_for_live が例外（API エラー等）を投げても、encoder を
                         # 起動したまま次サイクルへ渡さない。ここで一度止め、放棄する
                         # broadcast も削除してから re-raise し、外側の except Exception で
@@ -252,13 +260,40 @@ def main():
                         if not live:
                             # live にならなかった。放棄する broadcast を残すとキューに
                             # 積まれて次の試行を阻害するので、削除してから諦める。
+                            # 診断用の状態取得が失敗しても、停止と削除は必ず行う。
+                            try:
+                                status = youtube_broadcast.get_lifecycle_status(
+                                    youtube, broadcast_id
+                                )
+                            except Exception as status_exc:
+                                status = f"unknown ({status_exc})"
+                            print(
+                                f"stream_scheduler: broadcast {broadcast_id} did not go live "
+                                f"within {WAIT_FOR_LIVE_TIMEOUT_SECONDS}s "
+                                f"(lifeCycleStatus={status}); stopping encoder",
+                                file=sys.stderr,
+                            )
                             stop_and_clear()
                             youtube_broadcast.delete_broadcast(youtube, broadcast_id)
+                            print(
+                                f"stream_scheduler: deleted abandoned broadcast {broadcast_id}",
+                                file=sys.stderr,
+                            )
                         else:
+                            print(
+                                f"stream_scheduler: broadcast {broadcast_id} is live after "
+                                f"{time.monotonic() - wait_started:.1f}s",
+                                file=sys.stderr,
+                            )
                             consecutive_failures = 0
                     elif current_segment_end != active_segment[1]:
                         # セグメント境界をまたいだ（分割点に到達した）。一度止めて
                         # 次のポーリングサイクルで新しいセグメントとして再作成する。
+                        print(
+                            f"stream_scheduler: segment ended at {current_segment_end:%Y-%m-%d %H:%M}; "
+                            f"stopping encoder to start the next segment",
+                            file=sys.stderr,
+                        )
                         stop_and_clear()
                     elif not encoder_is_alive(rpicam_proc, ffmpeg_proc):
                         # 配信時間帯中にクラッシュした。broadcast は enableAutoStop なので、
@@ -266,6 +301,13 @@ def main():
                         # 再起動すると live な broadcast の無い stream へ送り続けてしまう。
                         # 一度止めて状態を戻し、次のポーリングサイクルで broadcast 作成から
                         # やり直す（生き残った片方の process もここで後始末する）。
+                        # returncode は stop_and_clear が terminate する前に取る（None なら生存）。
+                        print(
+                            f"stream_scheduler: encoder died "
+                            f"(rpicam-vid returncode={rpicam_proc.poll()}, "
+                            f"ffmpeg returncode={ffmpeg_proc.poll()}); stopping encoder",
+                            file=sys.stderr,
+                        )
                         stop_and_clear()
                 except Exception as exc:
                     # YouTube API のネットワークエラー・トークン失効等はここで捕まえ、

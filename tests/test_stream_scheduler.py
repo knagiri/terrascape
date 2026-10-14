@@ -818,11 +818,23 @@ def test_main_resets_failure_count_when_leaving_active_segment(monkeypatch):
     assert recorded == expected
 
 
-def _run_main_in_active_segment(wait_for_live_side_effect, sleep_fn):
+def _run_main_in_active_segment(
+    wait_for_live_side_effect,
+    sleep_fn,
+    encoder_procs=None,
+    encoder_alive=True,
+    stop_encoder_mock=None,
+):
     """常に夜間（アクティブなセグメント内）で main() を回し、SIGTERM で抜けるまで実行する。
 
     create_broadcast は呼ばれるたびに bcast-1, bcast-2, ... を返す。その mock を返す。
+    encoder_procs / encoder_alive / stop_encoder_mock で start_encoder の戻り値・
+    encoder_is_alive の戻り値・stop_encoder の差し替え先を指定できる。
     """
+    if encoder_procs is None:
+        encoder_procs = (MagicMock(), MagicMock())
+    if stop_encoder_mock is None:
+        stop_encoder_mock = MagicMock()
     now = _dt(23, 0)
     sunset = _dt(19, 0)
     sunrise = _dt(5, 0, day=2)
@@ -845,9 +857,9 @@ def _run_main_in_active_segment(wait_for_live_side_effect, sleep_fn):
              "wait_for_live",
              side_effect=wait_for_live_side_effect,
          ), \
-         patch.object(stream_scheduler, "start_encoder", return_value=(MagicMock(), MagicMock())), \
-         patch.object(stream_scheduler, "stop_encoder"), \
-         patch.object(stream_scheduler, "encoder_is_alive", return_value=True), \
+         patch.object(stream_scheduler, "start_encoder", return_value=encoder_procs), \
+         patch.object(stream_scheduler, "stop_encoder", stop_encoder_mock), \
+         patch.object(stream_scheduler, "encoder_is_alive", return_value=encoder_alive), \
          patch.object(stream_scheduler.time, "sleep", sleep_fn):
         mock_datetime_cls.now.return_value = now
         try:
@@ -961,3 +973,119 @@ def test_main_lists_pending_broadcasts_of_own_stream_with_shared_title_prefix(mo
 
     assert mock_list.call_args.args[1] == "stream-1"
     assert mock_create.call_args.args[2].startswith("PREFIX-CHECK ")
+
+
+def test_build_rpicam_command_silences_per_frame_log():
+    cmd = stream_scheduler.build_rpicam_command(_config())
+    assert cmd[cmd.index("--verbose") + 1] == "0"
+
+
+def test_main_logs_broadcast_id_on_start_and_live(monkeypatch, capsys):
+    """encoder 起動時と live 到達時に broadcast id（と live までの経過秒数）をログに出す。"""
+    _set_required_env(monkeypatch)
+
+    _run_main_in_active_segment([True], _sleep_n_times_then_sigterm(1))
+
+    err = capsys.readouterr().err
+    assert "stream_scheduler: started encoder for broadcast bcast-1" in err
+    live_line = next(l for l in err.splitlines() if "is live after" in l)
+    assert "bcast-1" in live_line
+
+
+def test_main_logs_lifecycle_status_when_wait_for_live_times_out(monkeypatch, capsys):
+    """live にならず諦めるとき、broadcast id・タイムアウト秒数・その時点の
+    lifeCycleStatus をログに出し、削除できたことも出す。"""
+    _set_required_env(monkeypatch)
+
+    with patch.object(
+        stream_scheduler.youtube_broadcast, "get_lifecycle_status", return_value="testing"
+    ):
+        _run_main_in_active_segment([False], _sleep_n_times_then_sigterm(1))
+
+    err = capsys.readouterr().err
+    timeout_line = next(l for l in err.splitlines() if "did not go live" in l)
+    assert "bcast-1" in timeout_line
+    assert f"{stream_scheduler.WAIT_FOR_LIVE_TIMEOUT_SECONDS}s" in timeout_line
+    assert "lifeCycleStatus=testing" in timeout_line
+    assert "stream_scheduler: deleted abandoned broadcast bcast-1" in err
+
+
+def test_main_stops_and_deletes_when_lifecycle_lookup_fails_after_timeout(
+    monkeypatch, capsys
+):
+    """タイムアウト後の診断用 get_lifecycle_status が例外を投げても、ログに残すだけで
+    encoder の停止と broadcast の削除は必ず行う。"""
+    _set_required_env(monkeypatch)
+
+    mock_stop = MagicMock()
+    with patch.object(
+        stream_scheduler.youtube_broadcast,
+        "get_lifecycle_status",
+        side_effect=RuntimeError("status lookup failed"),
+    ), patch.object(stream_scheduler.youtube_broadcast, "delete_broadcast") as mock_delete:
+        _run_main_in_active_segment(
+            [False], _sleep_n_times_then_sigterm(1), stop_encoder_mock=mock_stop
+        )
+
+    mock_delete.assert_called_once()
+    assert mock_delete.call_args.args[1] == "bcast-1"
+    # タイムアウト時の停止のみ（停止済みなので finally では止めない）。
+    mock_stop.assert_called_once()
+    err = capsys.readouterr().err
+    timeout_line = next(l for l in err.splitlines() if "did not go live" in l)
+    assert "status lookup failed" in timeout_line
+    assert "error handling segment" not in err
+
+
+def test_main_logs_both_returncodes_when_encoder_died(monkeypatch, capsys):
+    """encoder の死亡検知時、stop する前の rpicam-vid / ffmpeg の returncode をログに出す。"""
+    _set_required_env(monkeypatch)
+
+    rpicam_proc = MagicMock()
+    ffmpeg_proc = MagicMock()
+    rpicam_proc.poll.return_value = None  # 生存
+    ffmpeg_proc.poll.return_value = 255
+
+    _run_main_in_active_segment(
+        [True, True],
+        _sleep_n_times_then_sigterm(2),
+        encoder_procs=(rpicam_proc, ffmpeg_proc),
+        encoder_alive=False,
+    )
+
+    err = capsys.readouterr().err
+    died_line = next(l for l in err.splitlines() if "encoder died" in l)
+    assert "rpicam-vid returncode=None" in died_line
+    assert "ffmpeg returncode=255" in died_line
+
+
+def test_main_logs_reason_when_stopping_at_segment_boundary(monkeypatch, capsys):
+    """セグメント境界で止めるとき、その理由をログに出す。"""
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("MAX_SEGMENT_HOURS", "5")
+
+    times = [_dt(23, 0), _dt(0, 30, day=2)]
+    sunset = _dt(19, 0)
+    sunrise = _dt(5, 0, day=2)
+    original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+    with patch.object(
+             stream_scheduler, "current_night_sun_times", return_value=(sunset, sunrise)
+         ), \
+         patch("stream_scheduler.datetime.datetime") as mock_datetime_cls, \
+         patch.object(stream_scheduler.youtube_broadcast, "build_youtube_client", return_value=MagicMock()), \
+         patch.object(stream_scheduler.youtube_broadcast, "find_stream_id", return_value="stream-1"), \
+         patch.object(stream_scheduler.youtube_broadcast, "create_broadcast", return_value="bcast-1"), \
+         patch.object(stream_scheduler.youtube_broadcast, "wait_for_live", return_value=True), \
+         patch.object(stream_scheduler, "start_encoder", return_value=(MagicMock(), MagicMock())), \
+         patch.object(stream_scheduler, "stop_encoder"), \
+         patch.object(stream_scheduler, "encoder_is_alive", return_value=True), \
+         patch.object(stream_scheduler.time, "sleep", _sleep_n_times_then_sigterm(2)):
+        mock_datetime_cls.now.side_effect = times
+        try:
+            with pytest.raises(SystemExit):
+                stream_scheduler.main()
+        finally:
+            signal.signal(signal.SIGTERM, original_sigterm_handler)
+
+    err = capsys.readouterr().err
+    assert "stream_scheduler: segment ended at 2026-12-02 00:00" in err
